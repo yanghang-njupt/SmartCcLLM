@@ -1,0 +1,73 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+
+backends:
+  kimi:
+    url: https://api.kimi.com/coding/v1/messages
+    key_env: MOONSHOT_API_KEY
+    models:
+      default: k2.7
+  deepseek:
+    url: https://api.deepseek.com/anthropic/v1/messages
+    key_env: DEEPSEEK_API_KEY
+    models:
+      flash: deepseek-v4-flash
+      pro: deepseek-v4-pro
+      default: deepseek-v4-pro
+
+routing:
+  flash_first: true
+  fallback_tier_map:
+    "deepseek:pro": "kimi:default"
+    "kimi:default": "deepseek:pro"
+  session_sticky:
+    enabled: true
+    ttl_seconds: 600
+  token_length:
+    enabled: true
+    threshold_tokens: 100000
+    target: { backend: deepseek, tier: pro }
+
+circuit:
+  block_seconds_quota: 3600
+  block_seconds_server: 300
+  block_seconds_network: 60
+  block_seconds_permanent: 18000
+  backoff_max_seconds: 7200
+  backoff_multiplier: 2
+  probe_interval: 30
+  probe_timeout: 3
+  min_block_seconds: 60
+
+latency:
+  window: 8
+  slow_threshold_ms: 8000
+  degraded_sticky_s: 30
+
+timeouts:
+  total: 120.0
+  connect: 10.0
+  read: 120.0
+  pool: 10.0
+
+pool:
+  max_connections: 100
+  max_keepalive_connections: 20
+  keepalive_expiry: 60.0
+
+cache:
+  enabled: true
+  max_entries: 128
+  ttl_seconds: 300
+
+security:
+  auth_token_env: SP_AUTH_TOKEN
+  max_body_bytes: 33554432
+  error_body_truncate: 500
+
+http_proxy: null
+
+state_file: proxy_state.json
+usage_stats_file: usage_stats.json
+log_level: INFO
