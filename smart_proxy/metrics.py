@@ -193,14 +193,10 @@ class SimilarityBuffer:
 
     # ── 关键词自动萃取 ──────────────────────────────────────
 
-    def extract_keywords(self, min_samples: int = 3) -> list[str]:
-        """从历史数据中提取高频关键词，用于自动扩展 skip_flash 列表。
+    FLASH_SLOW_MS = 10000  # flash 超过此毫秒数即触发实时学习
 
-        分析逻辑：
-        - 找出所有 flash 尝试但最终失败/升级的请求文本
-        - 从中提取高频 2-4 字中文词组和英文片段
-        - 排除已有的标准关键词，避免重复
-        """
+    def extract_keywords(self, min_samples: int = 3) -> list[str]:
+        """从历史数据中提取高频关键词，用于自动扩展 skip_flash 列表。"""
         with self._lock:
             if len(self._buffer) < min_samples:
                 return []
@@ -212,14 +208,12 @@ class SimilarityBuffer:
                 text = (entry.get("text", "") or "").strip()
                 if not text:
                     continue
-                # 只关心 flash 不好的案例
                 if tier == "flash" and not success:
                     failed_texts.append(text)
 
             if len(failed_texts) < min_samples:
                 return []
 
-        # 提 n-gram
         from collections import Counter
         bi_counter: Counter = Counter()
         tri_counter: Counter = Counter()
@@ -240,9 +234,8 @@ class SimilarityBuffer:
                 if self._is_good_gram(gram):
                     quad_counter[gram] += 1
 
-        # 评分：频率 × 长度因子（长词权重更高）
         def score_gram(gram: str) -> float:
-            return len(gram) * 1.5  # 长度因子
+            return len(gram) * 1.5
 
         scored = []
         for gram, cnt in quad_counter.most_common(15):
@@ -257,14 +250,41 @@ class SimilarityBuffer:
 
         scored.sort(key=lambda x: -x[1])
 
-        # 去掉已有的关键词（避免重复）
         from .router import SKIP_FLASH_INDICATORS as existing_kw
         existing_set = {kw.lower() for kw in existing_kw}
         candidates = [g for g, _ in scored if g not in existing_set]
 
         count = len(candidates)
         logger.info(f"Auto-extracted {count} keywords from {len(failed_texts)} failed-flash records")
-        return candidates[:15]  # 最多加 15 个
+        return candidates[:15]
+
+    def extract_keywords_from_text(self, text: str) -> list[str]:
+        """从单条请求文本中提取关键词，用于实时学习。"""
+        if not text or len(text) < 3:
+            return []
+        chars = list(text)
+        candidates = set()
+        # 2-gram
+        for i in range(len(chars) - 1):
+            gram = "".join(chars[i:i+2])
+            if self._is_good_gram(gram):
+                candidates.add(gram)
+        # 3-gram
+        for i in range(len(chars) - 2):
+            gram = "".join(chars[i:i+3])
+            if self._is_good_gram(gram):
+                candidates.add(gram)
+        # 4-gram
+        for i in range(len(chars) - 3):
+            gram = "".join(chars[i:i+4])
+            if self._is_good_gram(gram):
+                candidates.add(gram)
+        # 过滤：去掉已有的关键词
+        from .router import get_all_indicators
+        existing = {kw.lower() for kw in get_all_indicators()}
+        result = [g for g in candidates if g not in existing]
+        logger.info(f"Extracted {len(result)} keyword candidates from text ({len(text)} chars)")
+        return result[:5]  # 最多取 5 个
 
     @staticmethod
     def _is_good_gram(gram: str) -> bool:

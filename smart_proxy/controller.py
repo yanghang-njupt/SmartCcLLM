@@ -11,7 +11,7 @@ import httpx
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 from .config import get_settings
-from .router import route
+from .router import route, extend_keywords
 from . import state
 from . import circuit as circuit_mod
 from .metrics import latency_tracker, similarity_buffer
@@ -197,6 +197,19 @@ def _extract_text_from_body(body):
     return str(text)
 
 
+def _learn_from_slow_flash(text: str, latency_ms: float, tier: str):
+    """实时学习：如果 flash 响应慢，立即从请求文本中萃取关键词并扩展。"""
+    if tier != "flash":
+        return
+    if latency_ms < similarity_buffer.FLASH_SLOW_MS:
+        return
+    keywords = similarity_buffer.extract_keywords_from_text(text)
+    if keywords:
+        added = extend_keywords(keywords)
+        if added:
+            logger.info(f"[AutoLearn] Flash slow ({latency_ms:.0f}ms) → added keywords: {added}")
+
+
 # ── 主入口 ───────────────────────────────────────────────
 
 async def handle_request(body: dict, req_headers: dict, client: httpx.AsyncClient) -> Response:
@@ -243,6 +256,9 @@ async def handle_request(body: dict, req_headers: dict, client: httpx.AsyncClien
 
             # 记录历史
             similarity_buffer.record_outcome(text, candidate, tier, True, latency_ms, "stream" if is_stream else "")
+
+            # 实时学习：flash 慢 → 自动萃取关键词
+            _learn_from_slow_flash(text, latency_ms, tier)
 
             # 安全网：flash 非流式检查不足
             if candidate == "deepseek" and tier == "flash" and not is_stream:
