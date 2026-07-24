@@ -154,11 +154,10 @@ async def health():
         }
     from .metrics import similarity_buffer
     from .router import get_all_indicators
+    kw = get_all_indicators()
     return {
         "status": "ok",
         "backends": backends_status,
         "similarity_buffer": similarity_buffer.stats(),
-        "skip_flash_keywords": {
-            "static": len(get_all_indicators()),
-        },
+        "skip_flash_keywords": kw,
     }
