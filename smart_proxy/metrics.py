@@ -250,8 +250,8 @@ class SimilarityBuffer:
 
         scored.sort(key=lambda x: -x[1])
 
-        from .router import SKIP_FLASH_INDICATORS as existing_kw
-        existing_set = {kw.lower() for kw in existing_kw}
+        from .router import all_keywords
+        existing_set = {kw.lower() for kw in all_keywords()}
         candidates = [g for g, _ in scored if g not in existing_set]
 
         count = len(candidates)

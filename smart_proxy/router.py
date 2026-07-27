@@ -59,6 +59,11 @@ def get_all_indicators() -> dict:
             "hard": len(HARD_CORE), "learned": len(_extra_keywords)}
 
 
+def all_keywords() -> list[str]:
+    """返回所有关键词(EASY/EDIT/HARD/learned)的扁平列表, 供学习去重用。"""
+    return list(EASY_VERBS) + list(EDIT_VERBS) + list(HARD_CORE) + list(_extra_keywords)
+
+
 # ── 文本提取 ─────────────────────────────────────────────
 
 def _extract_user_text(messages):

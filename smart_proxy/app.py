@@ -16,7 +16,7 @@ HISTORY_SAVE_INTERVAL = 300  # 每 5 分钟持久化一次历史数据
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    logger.info(f"SmartProxy v4.2 — Starting on {settings.server.host}:{settings.server.port}")
+    logger.info(f"SmartProxy v4.3 — Starting on {settings.server.host}:{settings.server.port}")
 
     # 注入 YAML 配置到全局 LatencyTracker
     from .metrics import latency_tracker, similarity_buffer, upgrade_store
@@ -26,13 +26,12 @@ async def lifespan(app: FastAPI):
         sticky_s=settings.latency.degraded_sticky_s,
     )
 
-    # 加载历史数据 → 自动萃取关键词 → 动态扩展
+    # 加载历史数据(延迟相似度预测用) + 升级信号学习库(主学习源)
     similarity_buffer.load()
     from .router import extend_keywords
-    keywords = similarity_buffer.extract_keywords(min_samples=2)
-    if keywords:
-        extend_keywords(keywords)
-    # 升级信号学习库(主学习源): 启动时把学到的领域词注入 router
+    # 主学习源: UpgradeStore 的 TF-DF 领域词注入 router
+    # (不再调 SimilarityBuffer.extract_keywords —— 它产字符 n-gram 碎片如 'de'/'e ',
+    #  作为子串关键词会污染评分导致请求误升 medium)
     learned = upgrade_store.learned_keywords()
     if learned:
         extend_keywords(learned)
