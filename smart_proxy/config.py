@@ -31,7 +31,7 @@ class RoutingConf(BaseModel):
     token_length: dict = Field(default_factory=lambda: {"enabled": False})
     # LLM 分类器(经济闸门): 仅低置信请求调用, 只看任务描述, 固定 ~200 token
     classifier: dict = Field(default_factory=lambda: {
-        "enabled": True,
+        "enabled": False,    # 默认关闭(启发式已覆盖), 需要时在 YAML 中开启
         "timeout": 1.5,
         "cache_size": 512,
         "min_input_tokens": 200,   # 上下文小于此值不调(判错也省不回成本)

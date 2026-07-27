@@ -2,7 +2,7 @@
 
 > **一句话：自动判断每个请求的难度，简单问题用便宜模型省钱，复杂问题自动升级到强模型保质量。**
 
-版本 4.3 · Python 3.10+ · MIT
+版本 4.4 · Python 3.10+ · MIT
 
 ---
 
@@ -111,13 +111,13 @@ SmartProxy 本身是一个 FastAPI 服务，内部有 13 个模块：
 | `__main__.py` | 启动入口，调 uvicorn |
 | `app.py` | FastAPI 装配、生命周期管理、后台探活、学习库持久化 |
 | `server.py` | 接收 HTTP 请求、鉴权、Body 解析 |
-| `router.py` | **请求清洗 + 启发式置信度评分**，决定走 flash / pro / kimi / 分类器 |
-| `classifier.py` | **LLM 分类器**（flash 2-token），仅低置信请求调用，含经济闸门 |
+| `router.py` | **请求清洗 + 信号密度评分**（去重、密度、边界），决定走 flash / pro / kimi |
+| `classifier.py` | LLM 分类器（flash 2-token），默认关闭，有需在 YAML 开 |
 | `controller.py` | **执行路由决策**，分类器集成、流式安全网、升级降级重试 |
 | `config.py` | 读 YAML 配置，支持热加载 |
 | `state.py` | 熔断/过载状态的 JSON 持久化 |
 | `circuit.py` | 熔断冷却时长的指数退避计算 |
-| `metrics.py` | 延迟追踪 + **UpgradeStore 升级信号学习(TF-DF)** + 相似度缓冲 |
+| `metrics.py` | 延迟追踪 + **UpgradeStore (jieba 词性标注+五层过滤)** + 相似度缓冲 |
 | `cache.py` | LRU 响应缓存（仅非流式） |
 | `logging_setup.py` | JSON 结构化日志 |
 
@@ -127,7 +127,7 @@ SmartProxy 本身是一个 FastAPI 服务，内部有 13 个模块：
 
 ### 3.1 分层难度评估（router.py + classifier.py）
 
-v4.3 起改为**分层路由**，不再单纯依赖关键词穷举。每次请求依次经过：
+v4.4 起改为**分层路由 + 信号密度 + 系统噪声清洗**。每次请求依次经过：
 
 ```
 最后一条 user 消息文本
@@ -135,29 +135,27 @@ v4.3 起改为**分层路由**，不再单纯依赖关键词穷举。每次请�
     ▼
 ⓪ 请求清洗 _sanitize()
     ├── 剥离 <system-reminder>/<transcript>/<function_results> 噪声
-    │   (修 v4.2 的假 hard 问题: 系统文本里的 design/architecture 误命中)
+    │   (修 v4.2/v4.3 的假 hard 问题: 无闭合 <system-reminder 的残渣内容
+    │    含 distributed/architecture → 直接判续传 flash, 不分类)
     └── 剥离后几乎为空 → 续传(tool_result 回传) → 直接 flash, 不分类
     │
     ▼
-① 启发式预筛 _heuristic_score()  (<1ms, 零成本)
-    ├── 小核心关键词(词边界匹配, 防 "concatenate"→"cat")
-    │   · EASY_VERBS(ls/grep/cat/read/查找…)  → easy 倾向
-    │   · EDIT_VERBS(fix/implement/重构…)      → medium 倾向 +12
-    │   · HARD_CORE(架构/设计/迁移/distributed) → hard 倾向 +30
-    ├── 结构信号: 文本长度、是否含代码块
-    ├── 超长上下文(>100k tokens) → +20
-    └── 历史升级风险(UpgradeStore) → +20 且强制走分类器
+① 启发式预筛 _heuristic_score() (<1ms, 零成本)
+    ├── 词边界匹配 + 去重计数(长词覆盖短词, 防 "修"+"修改" 双倍)
+    ├── CJK 结尾关键词右边界天然成立(防 "看一下config" 漏检)
+    ├── 数字+CJK 交界判边界("Vue2迁移" 能匹配 "迁移")
     │
-    ├── 高置信 easy  → flash       (跳过分类器, 零额外开销)
-    ├── 高置信 hard  → kimi/pro    (跳过分类器)
-    └── 低置信       → uncertain   ▼ 交 controller
-                                  ▼
-② LLM 分类器 classifier.classify()  (仅 uncertain 调用)
-    ├── 经济闸门: 上下文 < 200 token → 不调(判错也省不回成本) → easy
-    ├── flash · max_tokens=2 · 只看任务描述(截 800 字) → 输入恒定 ~200 token
-    ├── LRU+TTL 缓存, 相同任务文本命中
-    ├── 超时(1.5s)/失败 → 回退 easy(安全网兜底)
-    └── → easy / medium / hard
+    ├── 信号密度: easy ≥ 2× edit → 降级(修改变量+看看+找找 → easy)
+    │   · EASY_VERBS(ls/grep/cat/find/read/check/look/search/查看/看看/看…)
+    │   · EDIT_VERBS(fix/implement/refactor/rewrite/debug/编写/修改/重构/修复/修…)
+    │   · HARD_CORE(架构/设计/迁移/migrate/distributed/分布式/审计/kubernetes/微服务/集群/k8s…)
+    ├── 从 UpgradeStore 实时注入的领域词(+12/个)
+    ├── 超长上下文(>100k tokens) → +20
+    └── 历史升级风险(UpgradeStore trigram 相似) → +20
+    │
+    ├── 高置信 easy  → flash
+    ├── 高置信 hard  → kimi/pro
+    └── 低置信       → uncertain (分类器兜底, 默认关闭)
     │
     ▼
 最终难度 → 后端映射
@@ -203,10 +201,11 @@ v4.3 起改为**分层路由**，不再单纯依赖关键词穷举。每次请�
           └── 降级链：kimi → pro → flash → 502
 ```
 
-**v4.3 安全网重要变化**：
-- 流式请求现在也会被判定（后置解析 SSE `message_delta` 抓 `stop_reason`/`usage`）。v4.2 安全网只查非流式，而 Claude Code 全流式 → 从未触发。
-- `stop_reason=tool_use` **不再**当"不足"（agentic 流正常会调工具，原逻辑会误升级）。
-- 流式下答案已发完，无法中途升级 → 安全网在流式下只**采集学习信号**；当场补救靠前置分类器。
+**v4.4 安全网**：
+- 流式请求后置解析 SSE `message_delta` 抓 `stop_reason`/`usage`（Claude Code 全流式）。
+- `stop_reason=tool_use` **不再**当"不足"（agentic 流正常会调工具）。
+- 流式下只**采集学习信号**；当场补救靠前置分类器（默认关闭，有需再开）。
+- 非流式 flash 不足 → 立即升级 pro/kimi 重发。
 
 ### 3.3 熔断系统
 
@@ -225,26 +224,36 @@ v4.3 起改为**分层路由**，不再单纯依赖关键词穷举。每次请�
 
 ### 3.4 升级信号自学习（metrics.py）
 
-v4.3 用 **UpgradeStore** 替代了 v4.2 的 n-gram 萃取（原方案因 flash 几乎不报错而从未产出关键词）。
+v4.4 用 **jieba 词性标注 + 五层过滤** 替代了 v4.2 的 n-gram 萃取和 v4.3 的手写 TF-DF（原方案产出大量"的角/但我/在的"等无意义碎片）。
 
 **核心思路**：学习信号 = **安全网升级事件**（不是 flash 报错）。flash 被判不足 → 说明这个任务 flash 不够 → 记下来，下次类似任务提前避开 flash。
 
 ```
-flash 被安全网判不足 ──→ record_upgrade(text)  ──→ U 集合(升级文本)
+flash 被安全网判不足 ──→ record_upgrade(text) ──→ U 集合(升级文本)
 flash 正常返回      ──→ record_success(text) ──→ S 集合(成功文本)
                                               │
-                              TF-DF 分析: U 中高频 且 S 中低频的词
+                     五层过滤提取领域名词:
+                     ① jieba 词性标注 → 只留名词(n*)
+                         "检查"vn→剔  "现在"t→剔  "手部"n→留
+                     ② 停用词过滤 → 剔掉的/我/你/是/很…
+                     ③ 频次阈值 → ≥3 次升级事件
+                     ④ 对比过滤 → 不在 S 集合中
+                     ⑤ 通用名词黑名单 → 剔问题/情况/方法
                                               │
                                               ▼
-                              学到的"flash 不够"指示词
-                              (会自动浮现你的领域词, 如 串口/波特率/通讯协议)
+                              学到的领域词(手部/角度/弧度/单位)
                                               │
-                                              ▼
-                    ① 注入 router 的 _extra_keywords(+12 分)
-                    ② upgrade_risk: 新请求与 U 集相似 → 强制走分类器
+                    ① 实时注入 router._extra_keywords(+12 分)
+                    ② upgrade_risk: trigram 相似度 > 0.3 → +20 分
 ```
 
-**为什么是 TF-DF 而不是字符 n-gram**：v4.2 的 n-gram 萃取产出的是「波特」「特率」这种无意义碎片；TF-DF（英文按词、中文按 2/3-gram）能产出整词，且只在"升级集显著多于成功集"时才取，避免噪声。
+**五层过滤的效果**：
+
+| 版本 | 输入文本 | 产出关键词 |
+|------|---------|-----------|
+| v4.2 n-gram | "手部映射的角度有问题…" | `的角, 但我, 我现, 在的, 的问题` |
+| v4.3 TF-DF | 同上 | `角度, 问题, 检查, 现在, 单位` |
+| v4.4 jieba POS | 同上 | **`手部, 角度, 弧度, 单位`** |
 
 **持久化**：`logs/upgrade_store.json`，启动加载、每 5 分钟 + 关闭时落盘。`SimilarityBuffer`（相似度延迟预测）保留，但学习主源已切到 UpgradeStore。
 
@@ -271,7 +280,7 @@ flash 正常返回      ──→ record_success(text) ──→ S 集合(成功
 
 ```bash
 # 1. 安装依赖
-pip install fastapi uvicorn httpx pydantic pyyaml python-dotenv
+pip install fastapi uvicorn httpx pydantic pyyaml python-dotenv jieba
 
 # 2. 配置 API Key
 cp .env.example .env
@@ -514,10 +523,10 @@ python analyze_routing.py 2026-07-24   # 指定日期
 ```
 .cc-switch/
 ├── smart_proxy/              ★ 核心源码（13 个 .py 文件）
-│   ├── router.py             ★★★ 请求清洗 + 启发式置信度评分
-│   ├── classifier.py         ★★★ LLM 分类器(经济闸门)
+│   ├── router.py             ★★★ 请求清洗 + 信号密度评分(去重/边界/密度)
+│   ├── classifier.py               LLM 分类器(默认关闭)
 │   ├── controller.py         ★★★ 请求编排 + 流式安全网 + 升级降级
-│   ├── metrics.py            ★★  升级信号学习(TF-DF) + 延迟追踪
+│   ├── metrics.py            ★★  jieba 词性标注+五层过滤 + 延迟追踪
 │   ├── app.py                ★    FastAPI 装配 + 探活 + 学习库持久化
 │   ├── server.py                 请求 handler + 鉴权
 │   ├── config.py                 YAML 热加载配置

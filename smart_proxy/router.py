@@ -26,14 +26,17 @@ logger = logging.getLogger("SmartProxy.Router")
 # easy: 读/搜/列/找文件 类动词(词边界匹配, 防 "concatenate"→"cat")
 EASY_VERBS = [
     "ls", "grep", "cat", "find", "read", "list", "show", "open", "browse", "glob",
-    "查看", "列出", "查找", "搜索", "读取", "看一下", "找一下", "浏览",
+    "check", "look", "search", "get",
+    "查看", "列出", "查找", "搜索", "读取", "看一下", "找一下", "浏览", "看看", "看",
 ]
 # medium: 单文件修复/小重构类动词
-EDIT_VERBS = ["fix", "implement", "refactor", "rewrite", "debug", "编写", "修改", "重构", "修复", "重写"]
+EDIT_VERBS = ["fix", "implement", "refactor", "rewrite", "debug",
+              "编写", "修改", "重构", "修复", "重写", "修"]
 # hard: 多文件/架构/迁移/审计
 HARD_CORE = [
     "架构", "设计", "迁移", "migrate", "distributed", "分布式",
     "审计", "oauth", "end-to-end", "kafka", "kubernetes", "微服务",
+    "集群", "k8s",
 ]
 
 # ── 动态扩展: UpgradeStore 学到的词(按 medium 计分) ────────
@@ -77,10 +80,24 @@ def _extract_user_text(messages):
 
 
 # ── 请求清洗: 剥离 Claude Code 注入的噪声 ─────────────────
+# ── 系统噪声的正则(两遍: 先删闭合块, 再删无闭合的孤立标签) ──
 _SYSREM_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL | re.IGNORECASE)
+_SYSREM_OPEN_RE = re.compile(r"<system-reminder[^>]*>", re.IGNORECASE)  # 处理未关闭的标签
 _TRANSCRIPT_RE = re.compile(r"<transcript>.*?</transcript>", re.DOTALL | re.IGNORECASE)
+_TRANSCRIPT_OPEN_RE = re.compile(r"<transcript[^>]*>", re.IGNORECASE)
 _FUNCRESULTS_RE = re.compile(r"<function_results>.*?</function_results>", re.DOTALL | re.IGNORECASE)
 _ANTML_FUNCRESULTS_RE = re.compile(r"<antml:function_results>.*?</antml:function_results>", re.DOTALL | re.IGNORECASE)
+
+
+def _drop_noise(text: str) -> str:
+    """多遍删除所有已知系统标签(无论是否闭合)。"""
+    text = _SYSREM_RE.sub("", text)
+    text = _SYSREM_OPEN_RE.sub("", text)     # 抓遗漏的未关闭标签
+    text = _TRANSCRIPT_RE.sub("", text)
+    text = _TRANSCRIPT_OPEN_RE.sub("", text)
+    text = _FUNCRESULTS_RE.sub("", text)
+    text = _ANTML_FUNCRESULTS_RE.sub("", text)
+    return text
 
 
 def _sanitize(text: str) -> tuple[str, bool]:
@@ -88,15 +105,28 @@ def _sanitize(text: str) -> tuple[str, bool]:
 
     is_continuation=True 表示这是工具结果回传/系统文本主导(非新问题),
     直接走 flash, 不进分类器。
+
+    关键处理: 遇到无 </system-reminder> 闭合的标签(Claude Code 常见),
+    内容中混有架构/设计/分布式等关键词会误判 hard。
+    判据: 文本以 <system-reminder 开头但无闭合 → 续传 flash。
     """
     if not text:
         return "", True
-    original_len = len(text)
-    text = _SYSREM_RE.sub("", text)
-    text = _TRANSCRIPT_RE.sub("", text)
-    text = _FUNCRESULTS_RE.sub("", text)
-    text = _ANTML_FUNCRESULTS_RE.sub("", text)
-    clean = text.strip()
+
+    # 检测未闭合的 <system-reminder: 以标签开头但没有 </system-reminder>
+    stripped = text.strip()
+    has_closed = "</system-reminder>" in text
+    no_closing_sysrem = (
+        stripped.lower().startswith("<system-reminder")
+        and not has_closed
+    )
+
+    clean = _drop_noise(text).strip()
+
+    # 未闭合标签 → 内容全是系统提示残渣, 真实指令在下一条消息
+    if no_closing_sysrem:
+        return "", True
+
     # 仅当剥离后几乎为空(纯系统文本/工具结果回传, 无真实指令)才判续传。
     # 短但真实的指令("ls -la"/"看一下 app.py")交给启发式, 不误杀。
     is_continuation = len(clean) < 3
@@ -111,14 +141,25 @@ def _is_word_boundary(text: str, idx: int) -> bool:
     ch = text[idx]
     if '一' <= ch <= '鿿' or '㐀' <= ch <= '䶿':
         return True  # CJK 天然边界
+    if ch.isdigit():
+        return True  # 数字与CJK/英文之间也是边界(防 "Vue2迁移" 不匹配 "迁移")
     return not ch.isalnum()
 
 
 def _match(text: str, kw: str) -> bool:
-    """子串 + 词边界匹配。"""
+    """子串 + 词边界匹配。
+
+    CJK 结尾的 keyword 右边界天然成立(不管后面是英文/数字),
+    解决 "看一下config" 中 "看一下" 不匹配的问题。
+    """
     i = text.find(kw)
     while i != -1:
-        if _is_word_boundary(text, i - 1) and _is_word_boundary(text, i + len(kw)):
+        left_ok = _is_word_boundary(text, i - 1)
+        right_ok = _is_word_boundary(text, i + len(kw))
+        # CJK 结尾: 右边界天然成立(如 "看一下" 后跟英文也不截断)
+        if not right_ok and kw and '一' <= kw[-1] <= '鿿':
+            right_ok = True
+        if left_ok and right_ok:
             return True
         i = text.find(kw, i + 1)
     return False
@@ -191,17 +232,58 @@ def _heuristic_score(clean: str, settings: Settings) -> tuple[int, str, str]:
     """返回 (score, confidence, difficulty_hint)。
 
     confidence: "high" 直接路由; "low" 交 controller 调分类器
+
+    关键设计 — 信号密度: 一个"修改"夹在一堆"看看/找找"中间，
+    大概率只是多步简单任务(改个变量名), 不应升级到 pro。
+    用 easy/edit 信号比例来区分。
     """
     lower = clean.lower()
     score = 0
 
-    has_easy = any(_match(lower, v) for v in EASY_VERBS)
-    has_edit = any(_match(lower, v) for v in EDIT_VERBS)
+    # 去重计数: 长词包含短词时只计长词(防 "修改"+"修" 双倍)
+    def _dedup_matches(words: list[str], target: str) -> list[str]:
+        positioned = []
+        for w in words:
+            pos = target.find(w)
+            while pos != -1:
+                left_ok = _is_word_boundary(target, pos - 1)
+                right_ok = _is_word_boundary(target, pos + len(w))
+                if not right_ok and w and '一' <= w[-1] <= '鿿':
+                    right_ok = True  # CJK 结尾天然边界
+                if left_ok and right_ok:
+                    positioned.append((w, pos, len(w)))
+                pos = target.find(w, pos + 1)
+        positioned.sort(key=lambda x: -x[2])  # by length desc
+        kept = []
+        occupied = set()
+        for word, pos, ln in positioned:
+            span = set(range(pos, pos + ln))
+            if not span & occupied:
+                kept.append(word)
+                occupied |= span
+        return kept
+
     hard_hits = [v for v in HARD_CORE if _match(lower, v)]
+    edit_hits = _dedup_matches(EDIT_VERBS, lower)
+    easy_hits = _dedup_matches(EASY_VERBS, lower)
+    hard_count = len(hard_hits)
+    edit_count = len(edit_hits)
+    easy_count = len(easy_hits)
+
+    # hard 关键词是确定性的(架构/审计/迁移), 不会被 easy 信号稀释
     for _ in hard_hits:
         score += 30
-    if has_edit:
+
+    # edit 关键词可能只是改一行。easy 信号密集时降权:
+    # "修改变量名 + 看一下代码 + 找一下文件" → 改个变量名而已, easy
+    # "重构模块 + implement oauth" → 真正的工程任务, medium
+    has_edit = edit_count > 0
+    if has_edit and easy_count >= 2 * edit_count:
+        # easy 信号压倒性多 → 一个 trivial edit 夹在浏览/搜索中
+        has_edit = False  # 不按 medium 计分
+    else:
         score += 12
+
     for kw in _extra_keywords:
         if kw and kw in lower:
             score += 12
@@ -214,6 +296,8 @@ def _heuristic_score(clean: str, settings: Settings) -> tuple[int, str, str]:
             score += EXTRA_LONG_PENALTY
 
     long_text = len(clean) > 2000
+
+    has_easy = easy_count > 0
 
     # 高置信判定
     if hard_hits:

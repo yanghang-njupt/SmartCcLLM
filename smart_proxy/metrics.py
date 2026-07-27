@@ -168,7 +168,7 @@ class SimilarityBuffer:
             Path(filepath).parent.mkdir(parents=True, exist_ok=True)
             Path(filepath).write_text(
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            logger.info(f"History saved ({len(data)} records) → {filepath}")
+            logger.info(f"History saved ({len(data)} records) -> {filepath}")
         except Exception as e:
             logger.error(f"Failed to persist history: {e}")
 
@@ -183,7 +183,7 @@ class SimilarityBuffer:
             with self._lock:
                 for entry in data:
                     self._buffer.append(entry)
-            logger.info(f"History loaded ({len(data)} records) ← {filepath}")
+            logger.info(f"History loaded ({len(data)} records) <- {filepath}")
             return True
         except FileNotFoundError:
             return False
@@ -314,10 +314,33 @@ class UpgradeStore:
     学习信号 = 安全网升级事件(不是 flash 报错 —— flash 几乎不报错)。
     维护两个文本集: U(升级/不足) vs S(flash 成功), 取 U 中高频且 S 中低频的词,
     作为"flash 不够"的指示词, 反哺 router 评分。
+
+    v4.4: 中文 tokenize 优先用 jieba 分词, fallback 停用词过滤 n-gram。
     """
 
     HISTORY_FILE = "upgrade_store.json"
     _MAX = 200
+
+    # 中文停用词: 代词/助词/连词/量词 — 不参与 TF-DF
+    _CN_STOP = frozenset([
+        "的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一",
+        "个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没",
+        "看", "好", "自己", "这", "那", "他", "她", "它", "们", "些", "什么",
+        "怎么", "如何", "因为", "所以", "但是", "但", "却", "而", "或", "如果",
+        "虽然", "可以", "还是", "这个", "那个", "吗", "呢", "吧", "啊", "哦",
+        "嗯", "哈", "呀", "被", "把", "让", "从", "对", "与", "及", "其",
+        "以", "之", "为", "所", "能", "将", "已", "正在", "已经", "还", "又",
+        "再", "才", "刚", "便", "则", "只", "无", "各", "每", "某", "请", "谢",
+        "现", "老", "次", "搞", "现在", "是不是", "搞错", "错了",
+    ])
+
+    @staticmethod
+    def _has_stop(gram: str) -> bool:
+        """n-gram 中任一字符是停用字符则过滤。"""
+        for ch in gram:
+            if ch in UpgradeStore._CN_STOP:
+                return True
+        return False
 
     def __init__(self):
         self._upgraded: list[str] = []
@@ -328,17 +351,57 @@ class UpgradeStore:
         self.load()
 
     def _tokenize(self, text: str) -> list[str]:
-        """英文按词(>=3 字符), 中文按 2/3-gram(连续中文段)。"""
+        """英文按词(>=3字母), 中文优先 jieba 分词, fallback 停用词过滤 n-gram。
+
+        jieba:  "手部映射的角度有问题" -> [手部, 映射, 角度, 问题]
+        n-gram: 同句 + 停用词过滤      -> [手部, 映射, 角度, 问题]
+        """
         tokens: list[str] = []
+
+        # 1. 英文:  >=3 字母/数字组合词
         low = (text or "").lower()
         for m in re.findall(r"[a-z][a-z0-9_]{2,}", low):
             tokens.append(m)
-        for seg in re.findall(r"[\u4e00-\u9fff]+", text or ""):
-            for i in range(len(seg) - 1):
-                tokens.append(seg[i:i+2])
-            for i in range(len(seg) - 2):
-                tokens.append(seg[i:i+3])
+
+        # 2. 中文: jieba 优先, 未安装时退化
+        try:
+            import jieba as _jieba
+            for w in _jieba.cut(text, cut_all=False):
+                w = w.strip()
+                if len(w) >= 2 and w not in self._CN_STOP:
+                    tokens.append(w)
+        except ImportError:
+            for seg in re.findall(r"[一-鿿]+", text or ""):
+                for i in range(len(seg) - 1):
+                    bi = seg[i:i+2]
+                    if not self._has_stop(bi):
+                        tokens.append(bi)
+                for i in range(len(seg) - 2):
+                    tri = seg[i:i+3]
+                    if not self._has_stop(tri):
+                        tokens.append(tri)
+
         return tokens
+
+    def _fallback_extract(self, u_all: str, s_all: str) -> list[str]:
+        """jieba 不可用时的降级方案：字符 n-gram + 严格去噪。"""
+        u_tokens = [t for txt in self._upgraded for t in self._tokenize(txt)]
+        s_tokens = [t for txt in self._success[-len(self._upgraded):]
+                    for t in self._tokenize(txt)]
+        u_freq = Counter(u_tokens)
+        s_freq = Counter(s_tokens)
+        u_total = max(1, len(u_tokens))
+        s_total = max(1, len(s_tokens))
+        scored = []
+        for tok, cnt in u_freq.items():
+            if cnt < 3:
+                continue
+            u_rate = cnt / u_total
+            s_rate = s_freq.get(tok, 0) / s_total
+            if u_rate > s_rate * 3 and len(tok) >= 2:
+                scored.append((tok, u_rate - s_rate))
+        scored.sort(key=lambda x: -x[1])
+        return [t for t, _ in scored[:20]]
 
     def record_upgrade(self, text: str, reason: str = ""):
         if not text or len(text.strip()) < 3:
@@ -363,34 +426,59 @@ class UpgradeStore:
                 self._recompute_locked()
                 self._dirty = True
 
+    # 通用名词——高频但对任务难度无指示意义
+    _CN_GENERIC_NOUNS = frozenset([
+        "问题", "情况", "方法", "东西", "时候", "原因", "结果", "内容",
+        "部分", "方面", "方式", "过程", "地方", "时间", "事情",
+    ])
+
     def _recompute_locked(self):
         if len(self._upgraded) < 3:
             return
-        u_tokens = [t for txt in self._upgraded for t in self._tokenize(txt)]
-        s_tokens = [t for txt in self._success for t in self._tokenize(txt)]
-        u_freq = Counter(u_tokens)
-        s_freq = Counter(s_tokens)
-        u_total = max(1, len(u_tokens))
-        s_total = max(1, len(s_tokens))
-        scored = []
-        for tok, cnt in u_freq.items():
-            if cnt < 2:
-                continue
-            u_rate = cnt / u_total
-            s_rate = s_freq.get(tok, 0) / s_total
-            if u_rate > s_rate * 2:
-                scored.append((tok, u_rate - s_rate))
-        scored.sort(key=lambda x: -x[1])
-        new_kw = [t for t, _ in scored[:20]]
+        u_all = "\n".join(self._upgraded)
+        s_all = "\n".join(self._success[-len(self._upgraded):])
+
+        try:
+            import jieba.posseg as _ps
+            # 只用 U 中的名词做候选(领域词都是名词: 手部/角度/弧度/串口/波特率)
+            u_nouns = Counter()
+            for txt in self._upgraded:
+                seen = set()
+                for w, flag in _ps.cut(txt):
+                    if flag.startswith("n") and len(w) >= 2 and w not in self._CN_STOP:
+                        if w not in seen:
+                            u_nouns[w] += 1
+                            seen.add(w)
+            # 去掉在成功文本中也出现的词 + 通用名词
+            s_nouns = set()
+            for txt in self._success[-len(self._upgraded):]:
+                for w, flag in _ps.cut(txt):
+                    if flag.startswith("n") and len(w) >= 2:
+                        s_nouns.add(w)
+            candidates = [(w, c) for w, c in u_nouns.items()
+                         if c >= 3 and w not in s_nouns
+                         and w not in self._CN_GENERIC_NOUNS]
+            candidates.sort(key=lambda x: -x[1])
+            new_kw = [w for w, _ in candidates[:20]]
+        except ImportError:
+            new_kw = self._fallback_extract(u_all, s_all)
         if new_kw != self._keywords:
             self._keywords = new_kw
+            # 实时注入到 router 关键词库, 不等重启
+            try:
+                from .router import extend_keywords as _extend
+                added = _extend(new_kw)
+                if added:
+                    logger.info(f"[UpgradeLearn] injected {len(added)} keywords to router: {added}")
+            except Exception:
+                pass
 
     def learned_keywords(self) -> list[str]:
         with self._lock:
             return list(self._keywords)
 
     def upgrade_risk(self, text: str) -> bool:
-        """新请求是否与历史升级请求相似 → 高风险(应避免 flash)。"""
+        """新请求是否与历史升级请求相似 -> 高风险(应避免 flash)。"""
         with self._lock:
             if not self._upgraded:
                 return False
@@ -429,7 +517,7 @@ class UpgradeStore:
             tmp = filepath + ".tmp"
             Path(tmp).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, filepath)
-            logger.info(f"UpgradeStore saved → {filepath}")
+            logger.info(f"UpgradeStore saved -> {filepath}")
         except Exception as e:
             logger.error(f"UpgradeStore persist failed: {e}")
 
