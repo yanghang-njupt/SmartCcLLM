@@ -29,6 +29,13 @@ class RoutingConf(BaseModel):
     fallback_tier_map: dict[str, str] = Field(default_factory=dict)
     session_sticky: dict = Field(default_factory=lambda: {"enabled": False, "ttl_seconds": 600})
     token_length: dict = Field(default_factory=lambda: {"enabled": False})
+    # LLM 分类器(经济闸门): 仅低置信请求调用, 只看任务描述, 固定 ~200 token
+    classifier: dict = Field(default_factory=lambda: {
+        "enabled": True,
+        "timeout": 1.5,
+        "cache_size": 512,
+        "min_input_tokens": 200,   # 上下文小于此值不调(判错也省不回成本)
+    })
 
 
 class CircuitConf(BaseModel):

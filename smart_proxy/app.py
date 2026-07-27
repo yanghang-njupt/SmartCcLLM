@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"SmartProxy v4.2 — Starting on {settings.server.host}:{settings.server.port}")
 
     # 注入 YAML 配置到全局 LatencyTracker
-    from .metrics import latency_tracker, similarity_buffer
+    from .metrics import latency_tracker, similarity_buffer, upgrade_store
     latency_tracker.configure(
         window=settings.latency.window,
         slow_ms=settings.latency.slow_threshold_ms,
@@ -28,10 +28,18 @@ async def lifespan(app: FastAPI):
 
     # 加载历史数据 → 自动萃取关键词 → 动态扩展
     similarity_buffer.load()
+    from .router import extend_keywords
     keywords = similarity_buffer.extract_keywords(min_samples=2)
     if keywords:
-        from .router import extend_keywords
         extend_keywords(keywords)
+    # 升级信号学习库(主学习源): 启动时把学到的领域词注入 router
+    learned = upgrade_store.learned_keywords()
+    if learned:
+        extend_keywords(learned)
+        logger.info(f"Loaded {len(learned)} learned keywords from UpgradeStore")
+    # 分类器缓存容量热配置
+    from . import classifier as classifier_mod
+    classifier_mod.configure(cache_size=settings.routing.classifier.get("cache_size", 512))
 
     app.state.client = httpx.AsyncClient(
         timeout=httpx.Timeout(
@@ -48,8 +56,8 @@ async def lifespan(app: FastAPI):
         proxy=settings.http_proxy,
     )
     probe = asyncio.create_task(_probe_loop(app.state.client, settings))
-    # 定时保存历史
-    persist_task = asyncio.create_task(_persist_loop(similarity_buffer))
+    # 定时保存历史 + 升级学习库
+    persist_task = asyncio.create_task(_persist_loop(similarity_buffer, upgrade_store))
     yield
     probe.cancel()
     persist_task.cancel()
@@ -63,16 +71,18 @@ async def lifespan(app: FastAPI):
         pass
     # 关闭前保存一次
     similarity_buffer.persist()
+    upgrade_store.persist()
     await app.state.client.aclose()
     logger.info("SmartProxy — Shutdown complete")
 
 
-async def _persist_loop(buf):
-    """定时将历史数据持久化到磁盘。"""
+async def _persist_loop(buf, ustore):
+    """定时将历史数据 + 升级学习库持久化到磁盘。"""
     while True:
         try:
             await asyncio.sleep(HISTORY_SAVE_INTERVAL)
             buf.persist()
+            ustore.persist()
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -152,12 +162,15 @@ async def health():
             "overloaded": overloaded,
             "latency": latency_tracker.stats(name),
         }
-    from .metrics import similarity_buffer
+    from .metrics import similarity_buffer, upgrade_store
     from .router import get_all_indicators
+    from . import classifier as classifier_mod
     kw = get_all_indicators()
     return {
         "status": "ok",
         "backends": backends_status,
         "similarity_buffer": similarity_buffer.stats(),
+        "upgrade_store": upgrade_store.stats(),
+        "classifier_cache": classifier_mod.cache_stats(),
         "skip_flash_keywords": kw,
     }

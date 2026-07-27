@@ -28,6 +28,12 @@ routing:
     enabled: true
     threshold_tokens: 100000
     target: { backend: deepseek, tier: pro }
+  # LLM 分类器(经济闸门): 仅低置信请求调用, 只看任务描述, 固定 ~200 token
+  classifier:
+    enabled: true
+    timeout: 1.5            # 分类器超时(秒), 超时回退启发式
+    cache_size: 512         # LRU 缓存条目
+    min_input_tokens: 200   # 上下文小于此值不调(判错也省不回成本)
 
 circuit:
   block_seconds_quota: 3600

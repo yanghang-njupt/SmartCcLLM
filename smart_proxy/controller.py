@@ -1,35 +1,40 @@
-"""请求编排 —— 三级难度路由 + 安全网降级
+"""请求编排 —— 分层路由 + LLM 分类器 + 流式安全网 + 升级信号学习
 
-流程：
-  1. route() 在发送前评估难度 → (easy | medium | hard)
-  2. 按难度选择 tier 发送请求
-  3. 成功 → 非流式检查安全网 → 返回
-  4. 失败 → 按降级链依次尝试下一级
+流程:
+  1. route() 预判难度(easy/medium/hard/uncertain/continuation)
+  2. uncertain → 经济闸门(上下文太小则跳过) → flash 2-token 分类器 → 定档
+  3. 按难度选 tier 发送
+  4. flash 响应:
+     - 非流式: 读 body 检查 inadequate → 升级 + record_upgrade
+     - 流式:   转发同时后置抓 stop_reason/usage → record_upgrade/success
+       (流式无法中途升级, 安全网在此作"学习信号采集器")
+  5. 失败 → 降级链
 """
 import json, time, logging, traceback
 import httpx
 from fastapi import Response
 from fastapi.responses import StreamingResponse
-from .config import get_settings
-from .router import route, extend_keywords
+from .config import get_settings, Settings
+from .router import route, _pick_best
 from . import state
 from . import circuit as circuit_mod
-from .metrics import latency_tracker, similarity_buffer
+from .metrics import latency_tracker, similarity_buffer, upgrade_store
 from .cache import cache
 from .logging_setup import request_id_ctx
+from . import classifier
 
 logger = logging.getLogger("SmartProxy.Controller")
 
+
+# ── 工具 ─────────────────────────────────────────────────
 
 def _is_permanent_error(err_text):
     if not err_text:
         return False
     lower = err_text.lower()
-    markers = [
-        "usage limit", "quota", "billing cycle", "billing",
-        "rate limit exceeded", "insufficient_quota",
-        "exceeded your current quota", "upgrade your plan",
-    ]
+    markers = ["usage limit", "quota", "billing cycle", "billing",
+               "rate limit exceeded", "insufficient_quota",
+               "exceeded your current quota", "upgrade your plan"]
     return any(m in lower for m in markers)
 
 
@@ -41,10 +46,8 @@ def _strip_thinking_blocks(messages):
             continue
         content = msg.get("content")
         if isinstance(content, list):
-            new_content = [
-                block for block in content
-                if not (isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"))
-            ]
+            new_content = [b for b in content
+                           if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))]
             new_msg = dict(msg)
             new_msg["content"] = new_content
             cleaned.append(new_msg)
@@ -58,16 +61,57 @@ def _get_model(backend_conf, tier="default"):
     return models.get(tier, models["default"])
 
 
+def _backend_ready(name):
+    return not state.is_blocked(name) and not state.is_overloaded(name)
+
+
+def _fallback_chain(difficulty: str, settings) -> list[tuple[str, str]]:
+    if difficulty == "medium":
+        return [_pick_best(settings), ("deepseek", "flash")]
+    if difficulty == "hard":
+        return [("deepseek", "pro"), ("deepseek", "flash")]
+    # easy / uncertain / continuation → flash → pro → kimi
+    return [("deepseek", "pro"), _pick_best(settings)]
+
+
+def _token_estimate(messages) -> int:
+    total = 0
+    for msg in (messages if isinstance(messages, list) else []):
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    total += len(b.get("text", ""))
+        elif isinstance(content, str):
+            total += len(content)
+    return total // 4
+
+
+def _extract_text_from_body(body):
+    try:
+        msgs = body.get("messages", [])
+        if msgs:
+            last = msgs[-1]
+            content = last.get("content", "")
+            if isinstance(content, list):
+                return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+            return str(content)
+    except Exception:
+        pass
+    return ""
+
+
+# ── 安全网判定 ───────────────────────────────────────────
+
 def _check_inadequate(resp_body_bytes, latency_ms):
-    """安全网：检查 flash 响应是否不足（仅非流式）。"""
+    """非流式: 检查 flash 响应是否不足。"""
     try:
         body = json.loads(resp_body_bytes)
         stop_reason = body.get("stop_reason", "")
         output_tokens = body.get("usage", {}).get("output_tokens", 0)
         if stop_reason == "max_tokens" and output_tokens < 100:
             return True, "truncated"
-        if stop_reason == "tool_use":
-            return True, "tool_use"
+        # tool_use 不再当不足(agentic 流正常调工具), 仅作记录
     except Exception:
         pass
     if latency_ms > 15000:
@@ -75,37 +119,56 @@ def _check_inadequate(resp_body_bytes, latency_ms):
     return False, ""
 
 
-def _backend_ready(name):
-    return not state.is_blocked(name) and not state.is_overloaded(name)
+def _check_inadequate_streaming(stop_reason: str, output_tokens: int, total_ms: float):
+    """流式: 用后置抓到的 stop_reason/usage 判定(逻辑与非流式一致)。"""
+    if stop_reason == "max_tokens" and 0 < output_tokens < 100:
+        return True, "truncated"
+    if total_ms > 15000:
+        return True, "slow"
+    return False, ""
 
 
-def _pick_best(settings):
-    if "kimi" in settings.backends and _backend_ready("kimi"):
-        return "kimi", "default"
-    return "deepseek", "pro"
+# ── uncertain → 分类器(经济闸门) ──────────────────────────
+
+def _apply_difficulty(score, diff, settings):
+    score.difficulty = diff
+    if diff == "hard":
+        be, t = _pick_best(settings)
+        score.backend, score.tier = be, t
+    elif diff == "medium":
+        score.backend, score.tier = "deepseek", "pro"
+    else:  # easy
+        score.backend, score.tier = "deepseek", "flash"
+    return score
 
 
-def _fallback_chain(difficulty: str, settings) -> list[tuple[str, str]]:
-    """返回降级路径：失败时依次尝试。"""
-    if difficulty == "easy":
-        # flash → pro → kimi
-        return [("deepseek", "pro"), _pick_best(settings)]
-    if difficulty == "medium":
-        # pro → kimi → flash
-        return [_pick_best(settings), ("deepseek", "flash")]
-    # hard → pro → flash
-    return [("deepseek", "pro"), ("deepseek", "flash")]
+async def _resolve_uncertain(score, settings, client, messages, text, rid):
+    conf = settings.routing.classifier
+    if not conf.get("enabled", True):
+        return _apply_difficulty(score, "easy", settings)
+    # 经济闸门: 上下文极小 → 判错也省不回 200 token, 直接 easy
+    input_tokens = _token_estimate(messages)
+    min_tok = conf.get("min_input_tokens", 200)
+    if input_tokens < min_tok:
+        logger.info(f"[{rid}] Uncertain but tiny ctx({input_tokens}tok) → easy, skip classifier")
+        return _apply_difficulty(score, "easy", settings)
+    label = await classifier.classify(client, settings, text)
+    if label is None:
+        logger.info(f"[{rid}] Classifier fallback → easy")
+        label = "easy"
+    else:
+        logger.info(f"[{rid}] Classifier → {label}")
+    return _apply_difficulty(score, label, settings)
 
+
+# ── 请求发送 ─────────────────────────────────────────────
 
 async def _send_request(rid, candidate, tier, conf, body, req_headers,
                         settings, client, messages):
-    """发送请求，返回 (response_or_none, success, error_info)."""
     model = _get_model(conf, tier)
     req_body = {**body, "model": model}
-
     if candidate == "deepseek":
         req_body["messages"] = _strip_thinking_blocks(messages)
-
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {conf.key}",
@@ -120,7 +183,6 @@ async def _send_request(rid, candidate, tier, conf, body, req_headers,
         request = client.build_request("POST", conf.url, json=req_body, headers=headers)
         response = await client.send(request, stream=True)
         latency_ms = (time.time() - t_start) * 1000
-
         if response.status_code != 200:
             err_body = await response.aread()
             err_text = err_body.decode(errors='replace')
@@ -130,7 +192,6 @@ async def _send_request(rid, candidate, tier, conf, body, req_headers,
             latency_tracker.record(candidate, latency_ms, ok=False)
             await response.aclose()
             return None, False, (candidate, response.status_code, err_display)
-
         return response, True, (candidate, latency_ms, "")
     except Exception as e:
         latency_ms = (time.time() - t_start) * 1000
@@ -153,16 +214,14 @@ async def _return_response(resp, latency_ms, is_stream, model, messages, backend
                 except Exception:
                     pass
         return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
-    else:
-        resp_body = await resp.aread()
-        resp_ct = resp.headers.get("content-type", "application/json") if hasattr(resp, 'headers') else "application/json"
-        if settings.cache.enabled:
-            cache.put(model, messages, resp_body, resp_ct)
-        return Response(content=resp_body, status_code=200, media_type=resp_ct)
+    resp_body = await resp.aread()
+    resp_ct = resp.headers.get("content-type", "application/json") if hasattr(resp, 'headers') else "application/json"
+    if settings.cache.enabled:
+        cache.put(model, messages, resp_body, resp_ct)
+    return Response(content=resp_body, status_code=200, media_type=resp_ct)
 
 
 def _handle_error(rid, candidate_name, status_code, err_display, settings):
-    """熔断 + 退避。返回 (candidate, status_code, err_display) 或 None（非重试错误）。"""
     latency_tracker.mark_degraded(candidate_name)
     if status_code == 429:
         state.mark_overloaded(candidate_name)
@@ -181,33 +240,74 @@ def _handle_error(rid, candidate_name, status_code, err_display, settings):
     return None
 
 
-def _extract_text_from_body(body):
-    text = ""
+# ── 流式安全网: 转发 + 后置抓 stop_reason/usage 喂学习库 ───
+
+async def _stream_with_learning(resp, text: str, settings):
+    """转发流式响应(零修改), 同时解析 SSE 抓 stop_reason/usage,
+    流结束后判定 flash 是否不足 → 喂 upgrade_store。"""
+    stop_reason = ""
+    output_tokens = 0
+    buf = b""
+    t_start = time.time()
     try:
-        msgs = body.get("messages", [])
-        if msgs:
-            last = msgs[-1]
-            content = last.get("content", "")
-            if isinstance(content, list):
-                text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        async for chunk in resp.aiter_raw():
+            yield chunk
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == b"[DONE]":
+                    continue
+                try:
+                    evt = json.loads(payload)
+                except Exception:
+                    continue
+                if evt.get("type") == "message_delta":
+                    d = evt.get("delta", {}) or {}
+                    sr = d.get("stop_reason")
+                    if sr:
+                        stop_reason = sr
+                    u = evt.get("usage", {}) or {}
+                    if u.get("output_tokens"):
+                        output_tokens = u["output_tokens"]
+    finally:
+        total_ms = (time.time() - t_start) * 1000
+        try:
+            await resp.aclose()
+        except Exception:
+            pass
+        if text:
+            inadequate, reason = _check_inadequate_streaming(stop_reason, output_tokens, total_ms)
+            if inadequate:
+                upgrade_store.record_upgrade(text, reason or stop_reason or "stream_inadequate")
             else:
-                text = str(content)
-    except Exception:
-        pass
-    return str(text)
+                upgrade_store.record_success(text)
+        logger.debug(f"[stream-end] stop={stop_reason} out_tok={output_tokens} "
+                     f"total={total_ms:.0f}ms inadequate={inadequate if text else 'n/a'}")
 
 
-def _learn_from_slow_flash(text: str, latency_ms: float, tier: str):
-    """实时学习：如果 flash 响应慢，立即从请求文本中萃取关键词并扩展。"""
-    if tier != "flash":
-        return
-    if latency_ms < similarity_buffer.FLASH_SLOW_MS:
-        return
-    keywords = similarity_buffer.extract_keywords_from_text(text)
-    if keywords:
-        added = extend_keywords(keywords)
-        if added:
-            logger.info(f"[AutoLearn] Flash slow ({latency_ms:.0f}ms) → added keywords: {added}")
+async def _upgrade_flash_response(rid, resp_body, resp_ct, text, settings, is_stream,
+                                  body, req_headers, client, messages, conf):
+    """非流式 flash 被判不足 → 升级到 pro 重发。"""
+    upgrade_store.record_upgrade(text, "nonstream_inadequate")
+    up_dest = _fallback_chain("easy", settings)
+    if up_dest:
+        up_candidate, up_tier = up_dest[0]
+        up_conf = settings.backends.get(up_candidate)
+        if up_conf and _backend_ready(up_candidate):
+            up_resp, up_ok, up_err = await _send_request(
+                rid, up_candidate, up_tier, up_conf, body, req_headers, settings, client, messages)
+            if up_ok:
+                return await _return_response(up_resp, up_err[1], is_stream,
+                                              _get_model(up_conf, up_tier), messages, up_candidate, settings)
+            _handle_error(rid, up_candidate, up_err[1], up_err[2], settings)
+    # 升级失败 → 返回原 flash 结果
+    if settings.cache.enabled:
+        cache.put(_get_model(conf, "flash"), messages, resp_body, resp_ct)
+    return Response(content=resp_body, status_code=200, media_type=resp_ct)
 
 
 # ── 主入口 ───────────────────────────────────────────────
@@ -219,30 +319,34 @@ async def handle_request(body: dict, req_headers: dict, client: httpx.AsyncClien
     is_stream = body.get("stream", False)
 
     score = route(settings, messages)
-    text = _extract_text_from_body(body)
+    text = score.clean_text or _extract_text_from_body(body)
+
+    # uncertain → 经济闸门 + LLM 分类器
+    if score.difficulty == "uncertain":
+        score = await _resolve_uncertain(score, settings, client, messages, text, rid)
 
     logger.info(f"[{rid}] Route: {score.backend}/{score.tier} ({score.reason}) difficulty={score.difficulty}")
 
-    # ── 缓存检查（仅非流式 flash） ─────────────────────
+    # 会话粘性记录(成功后会刷新)
+    from .router import _set_sticky
+
+    # 缓存检查(仅非流式 flash)
     if not is_stream and settings.cache.enabled and score.tier == "flash":
         model = _get_model(settings.backends["deepseek"], "flash")
         cached = cache.get(model, messages)
         if cached is not None:
             logger.info(f"[{rid}] Cache hit")
             return Response(content=cached[0], status_code=200, media_type=cached[1],
-                          headers={"X-SP-Cache": "hit"})
+                            headers={"X-SP-Cache": "hit"})
 
-    # ── 构造降级链 ─────────────────────────────────────
-    attempts = [(score.backend, score.tier)]
-    attempts += _fallback_chain(score.difficulty, settings)
-    # 去重（相邻重复的去掉）
+    # 降级链
+    attempts = [(score.backend, score.tier)] + _fallback_chain(score.difficulty, settings)
     unique = [attempts[0]]
     for a in attempts[1:]:
         if a != unique[-1]:
             unique.append(a)
 
     last_error = None
-
     for candidate, tier in unique:
         conf = settings.backends.get(candidate)
         if not conf or not _backend_ready(candidate):
@@ -253,50 +357,37 @@ async def handle_request(body: dict, req_headers: dict, client: httpx.AsyncClien
 
         if success:
             latency_ms = err_info[1]
+            similarity_buffer.record_outcome(text, candidate, tier, True, latency_ms,
+                                              "stream" if is_stream else "")
 
-            # 记录历史
-            similarity_buffer.record_outcome(text, candidate, tier, True, latency_ms, "stream" if is_stream else "")
-
-            # 实时学习：flash 慢 → 自动萃取关键词
-            _learn_from_slow_flash(text, latency_ms, tier)
-
-            # 安全网：flash 非流式检查不足
-            if candidate == "deepseek" and tier == "flash" and not is_stream:
+            # flash 特殊处理: 安全网 + 学习
+            if candidate == "deepseek" and tier == "flash":
+                if is_stream:
+                    # 流式: 转发 + 后置学习(无法中途升级)
+                    latency_tracker.record(candidate, latency_ms, ok=True)
+                    _set_sticky(settings, messages, candidate, tier)
+                    return StreamingResponse(_stream_with_learning(resp, text, settings),
+                                             media_type="text/event-stream")
+                # 非流式: 读 body 检查
                 resp_body = await resp.aread()
+                resp_ct = resp.headers.get("content-type", "application/json") if hasattr(resp, 'headers') else "application/json"
                 inadequate, reason = _check_inadequate(resp_body, latency_ms)
                 if inadequate:
                     logger.info(f"[{rid}] Flash inadequate ({reason}) → upgrading")
                     similarity_buffer.record_outcome(text, candidate, tier, False, latency_ms, reason)
-                    # 直接使用第一个降级目标
-                    up_dest = _fallback_chain("easy", settings)
-                    if up_dest:
-                        up_candidate, up_tier = up_dest[0]
-                        up_conf = settings.backends.get(up_candidate)
-                        if up_conf and _backend_ready(up_candidate):
-                            up_resp, up_ok, up_err = await _send_request(
-                                rid, up_candidate, up_tier, up_conf, body, req_headers,
-                                settings, client, messages)
-                            if up_ok:
-                                return await _return_response(up_resp, up_err[1], is_stream,
-                                                             _get_model(up_conf, up_tier),
-                                                             messages, up_candidate, settings)
-                            _handle_error(rid, up_candidate, up_err[1], up_err[2], settings)
-                    # 升级失败，回退到非流式缓存结果
-                    if settings.cache.enabled:
-                        cache.put(_get_model(conf, "flash"), messages, resp_body,
-                                  resp.headers.get("content-type", "application/json") if hasattr(resp, 'headers') else "application/json")
-                    return Response(content=resp_body, status_code=200,
-                                  media_type=resp.headers.get("content-type", "application/json") if hasattr(resp, 'headers') else "application/json")
-
-                # flash 正常 → 缓存 + 返回
+                    return await _upgrade_flash_response(rid, resp_body, resp_ct, text, settings,
+                                                         is_stream, body, req_headers, client, messages, conf)
+                # flash 正常
+                upgrade_store.record_success(text)
+                _set_sticky(settings, messages, candidate, tier)
                 if settings.cache.enabled:
-                    cache.put(_get_model(conf, "flash"), messages, resp_body,
-                              resp.headers.get("content-type", "application/json") if hasattr(resp, 'headers') else "application/json")
-                return Response(content=resp_body, status_code=200,
-                              media_type=resp.headers.get("content-type", "application/json") if hasattr(resp, 'headers') else "application/json")
+                    cache.put(_get_model(conf, "flash"), messages, resp_body, resp_ct)
+                return Response(content=resp_body, status_code=200, media_type=resp_ct)
 
+            # 非 flash: 正常返回(不喂 flash 学习库)
+            _set_sticky(settings, messages, candidate, tier)
             return await _return_response(resp, latency_ms, is_stream,
-                                         _get_model(conf, tier), messages, candidate, settings)
+                                          _get_model(conf, tier), messages, candidate, settings)
 
         # 失败
         _, status_code, err_display = err_info
