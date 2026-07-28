@@ -19,11 +19,13 @@ backends:
 routing:
   flash_first: true
   fallback_tier_map:
+    # Kimi 优先: hard 默认走 kimi; 熔断器自动处理 403 quota → 降级 pro
     "deepseek:pro": "kimi:default"
     "kimi:default": "deepseek:pro"
   session_sticky:
     enabled: true
-    ttl_seconds: 600
+    ttl_seconds: 600        # flash 粘性: 同一会话 10 分钟复用
+    pro_ttl_seconds: 120    # pro 粘性更短: 避免 easy 追问被绑定在贵模型
   token_length:
     enabled: true
     threshold_tokens: 100000

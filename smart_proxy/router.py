@@ -41,16 +41,19 @@ HARD_CORE = [
 
 # ── 动态扩展: UpgradeStore 学到的词(按 medium 计分) ────────
 _extra_keywords: list[str] = []
+_MAX_EXTRA_KW = 200
 
 
 def extend_keywords(keywords: list[str]) -> list[str]:
-    """从历史/学习数据扩展关键词。"""
+    """从历史/学习数据扩展关键词。超出上限时淘汰最旧的。"""
     global _extra_keywords
     existing = {k.lower() for k in EASY_VERBS + EDIT_VERBS + HARD_CORE + _extra_keywords}
     added = [kw for kw in keywords if kw and kw.lower() not in existing]
-    _extra_keywords.extend(added)
     if added:
-        logger.info(f"Extended keywords ({len(added)}): {added}")
+        _extra_keywords.extend(added)
+        if len(_extra_keywords) > _MAX_EXTRA_KW:
+            _extra_keywords = _extra_keywords[-_MAX_EXTRA_KW:]
+        logger.info(f"Extended keywords (+{len(added)}, total {len(_extra_keywords)}): {added}")
     return added
 
 
@@ -105,6 +108,89 @@ def _drop_noise(text: str) -> str:
     return text
 
 
+# ── Claude Code 系统上下文剥离: 去掉 CLAUDE.md / skill / MCP 指令 ──
+# XML 标签层面的 _drop_noise 已经处理了 <system-reminder>...</system-reminder>。
+# 但 Claude Code 注入的 CLAUDE.md 内容、可用 skills 列表、MCP Server 指令
+# 是纯文本块，会溢出到 _sanitize() 之后。这些文本天然包含 "架构""设计""分布式"
+# 等 HARD_CORE 词 → 每个 +30 分 → 请求误判 Hard(60) 走 Pro/Kimi。
+#
+# 这些上下文块都有高度可辨的头部行，匹配后整块删除。
+_CC_HEADERS = [
+    # CLAUDE.md 注入
+    r"Contents of\s+\S*CLAUDE\.md[^\n]*\n",
+    r"# CLAUDE\.md\s*\n",
+    r"Behavioral guidelines to reduce common LLM coding mistakes[^\n]*\n",
+    r"Codebase and user instructions are shown below[^\n]*\n",
+    r"IMPORTANT: [Tt]hese (?:instructions|guidelines) OVERRIDE[^\n]*\n",
+    r"IMPORTANT: this context may or may not be relevant[^\n]*\n",
+    r"# currentDate\nToday'?s date is \d{4}-\d{2}-\d{2}\.\n?",
+    # —— skill / MCP / agent 清单 ——
+    r"The following skills are available for use with the Skill tool:\n(?:- [^\n]+\n)+",
+    r"(?:# )?MCP [Ss]erver [Ii]nstructions\n"
+    r"(?:The following MCP servers[^\n]*\n)?"
+    r"(?:## \w+\n)?",
+    r"Available agent types for the Agent tool:\n(?:- [^\n]+\n)+",
+    # —— session 标签 ——
+    r"<session>.*?</session>\s*",
+    # —— 系统提醒残余行 ——
+    r"As you answer the user'?s questions[^\n]*\n",
+]
+
+_CC_RE = re.compile("|".join(_CC_HEADERS), re.DOTALL | re.IGNORECASE)
+
+
+def _strip_cc_context(text: str) -> str:
+    """剥离 Claude Code 注入的系统上下文（CLAUDE.md/skill/MCP/agent 列表）。
+
+    在 _drop_noise() 之后调用 —— XML 标签已清除，
+    只剩纯文本系统指令，用已知头部行匹配并移除。
+    """
+    if not text or len(text) < 30:
+        return text
+    before = text
+    text = _CC_RE.sub("", text)
+    # 防范未标记的残留：头部行下面的内容可能不匹配，再做一次全扫描，
+    # 删除任何以已知头部开头的行及其后续缩进行
+    for header in [
+        "Contents of ",
+        "Behavioral guidelines to reduce",
+        "Codebase and user instructions",
+        "IMPORTANT: These instructions",
+        "IMPORTANT: these instructions",
+        "IMPORTANT: This context",
+        "The following skills are available",
+        "MCP Server Instructions",
+        "The following MCP servers",
+        "Available agent types for the Agent",
+        "# currentDate",
+        "As you answer",
+    ]:
+        idx = text.find(header)
+        if idx != -1:
+            # 从 header 行开始到下一个非缩进行结束，或到文本末尾
+            rest = text[idx:].replace("\r\n", "\n")  # 规范化 Windows 行尾
+            lines = rest.split("\n")
+            # 吃 header 行
+            consumed = 1
+            # 吃后续缩进行 / 连续列表项行
+            for i, line in enumerate(lines[1:], 1):
+                stripped_line = line.strip()
+                if not stripped_line:
+                    consumed += 1
+                    continue
+                if stripped_line.startswith("- ") or stripped_line.startswith("# "):
+                    consumed += 1
+                    continue
+                if line and line[0] in (" ", "\t"):
+                    consumed += 1
+                    continue
+                break
+            text = text[:idx] + "\n".join(lines[consumed:])
+    if text != before:
+        logger.debug(f"Stripped CC context: {len(before)} → {len(text)} chars")
+    return text.strip()
+
+
 def _sanitize(text: str) -> tuple[str, bool]:
     """剥离系统噪声, 返回 (clean_text, is_continuation)。
 
@@ -127,14 +213,22 @@ def _sanitize(text: str) -> tuple[str, bool]:
     )
 
     clean = _drop_noise(text).strip()
+    clean = _strip_cc_context(clean)  # v4.4: 剥离 CLAUDE.md/skill/MCP 系统上下文
 
     # 未闭合标签 → 内容全是系统提示残渣, 真实指令在下一条消息
     if no_closing_sysrem:
         return "", True
 
-    # 仅当剥离后几乎为空(纯系统文本/工具结果回传, 无真实指令)才判续传。
-    # 短但真实的指令("ls -la"/"看一下 app.py")交给启发式, 不误杀。
-    is_continuation = len(clean) < 3
+    # 防范混合场景: 文本同时包含闭合 </system-reminder> 和未闭合 <system-reminder。
+    # _drop_noise 去掉了闭合块, 但未闭合的 <system-reminder 仍残留在 clean 中。
+    if has_closed and "<system-reminder" in clean.lower():
+        clean = _SYSREM_OPEN_RE.sub("", clean).strip()
+
+    # 仅当剥离后为空才判续传。
+
+    # 仅当剥离后为空(纯系统文本/工具结果回传, 无真实指令)才判续传。
+    # "ls" / "cd" / "grep" 等短命令不走续传路径, 它们需要启发式评分 + sticky.
+    is_continuation = len(clean) == 0
     return clean, is_continuation
 
 
@@ -209,7 +303,11 @@ def _set_sticky(settings, messages, backend, tier):
     key = _session_key(messages)
     if not key:
         return
-    ttl = sticky.get("ttl_seconds", 600)
+    # Pro 粘性更短: 避免 easy 追问被绑定在贵模型上
+    if tier == "pro":
+        ttl = sticky.get("pro_ttl_seconds", 120)
+    else:
+        ttl = sticky.get("ttl_seconds", 600)
     with _sticky_lock:
         _sticky_store[key] = (backend, tier, time.time() + ttl)
 
@@ -221,6 +319,11 @@ def _is_available(name):
 
 
 def _pick_best(settings):
+    """选择最优 hard 后端: kimi 优先, 不可用时降级 deepseek pro。
+
+    熔断器会自动处理 kimi 403 quota → block 5h → _is_available 返回 False,
+    之后请求自动走 deepseek pro, 无需手动切换优先级。
+    """
     if "kimi" in settings.backends and _is_available("kimi"):
         return "kimi", "default"
     return "deepseek", "pro"
@@ -271,7 +374,6 @@ def _heuristic_score(clean: str, settings: Settings) -> tuple[int, str, str]:
     hard_hits = [v for v in HARD_CORE if _match(lower, v)]
     edit_hits = _dedup_matches(EDIT_VERBS, lower)
     easy_hits = _dedup_matches(EASY_VERBS, lower)
-    hard_count = len(hard_hits)
     edit_count = len(edit_hits)
     easy_count = len(easy_hits)
 
@@ -283,11 +385,12 @@ def _heuristic_score(clean: str, settings: Settings) -> tuple[int, str, str]:
     # "修改变量名 + 看一下代码 + 找一下文件" → 改个变量名而已, easy
     # "重构模块 + implement oauth" → 真正的工程任务, medium
     has_edit = edit_count > 0
-    if has_edit and easy_count >= 2 * edit_count:
-        # easy 信号压倒性多 → 一个 trivial edit 夹在浏览/搜索中
-        has_edit = False  # 不按 medium 计分
-    else:
-        score += 12
+    if has_edit:
+        if easy_count >= 2 * edit_count:
+            # easy 信号压倒性多 → 一个 trivial edit 夹在浏览/搜索中
+            has_edit = False  # 不按 medium 计分
+        else:
+            score += 12
 
     for kw in _extra_keywords:
         if kw and kw in lower:
@@ -305,9 +408,11 @@ def _heuristic_score(clean: str, settings: Settings) -> tuple[int, str, str]:
     has_easy = easy_count > 0
 
     # 高置信判定
-    if hard_hits:
-        return score, "high", "hard"
+    # v4.4: 不再因单个 hard 关键词就提前返回 hard。
+    # "设计"和"架构"在中文里太泛("设计一个登录页面"≠hard),
+    # 现在统一走 score 阈值: single hit=30<40→medium, 2+hits≥60→hard。
     if has_edit and (long_text or score >= THRESHOLD_MEDIUM):
+        return score, "high", ("medium" if score < THRESHOLD_HARD else "hard")
         return score, "high", ("medium" if score < THRESHOLD_HARD else "hard")
     if has_easy and not has_edit and not long_text:
         return score, "high", "easy"

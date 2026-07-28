@@ -15,7 +15,7 @@ import httpx
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 from .config import get_settings, Settings
-from .router import route, _pick_best
+from .router import route, _pick_best, _sanitize
 from . import state
 from . import circuit as circuit_mod
 from .metrics import latency_tracker, similarity_buffer, upgrade_store
@@ -103,14 +103,18 @@ def _extract_text_from_body(body):
 
 # ── 安全网判定 ───────────────────────────────────────────
 
-def _check_inadequate(resp_body_bytes, latency_ms):
+def _check_inadequate(resp_body_bytes, latency_ms, requested_max_tokens: int = 0):
     """非流式: 检查 flash 响应是否不足。"""
     try:
         body = json.loads(resp_body_bytes)
         stop_reason = body.get("stop_reason", "")
         output_tokens = body.get("usage", {}).get("output_tokens", 0)
-        if stop_reason == "max_tokens" and output_tokens < 100:
-            return True, "truncated"
+        if stop_reason == "max_tokens":
+            # 仅当输出远低于请求上限时才算截断(防短输出误判)
+            if requested_max_tokens > 0 and output_tokens >= requested_max_tokens * 0.5:
+                return False, ""  # 输出了 ≥50% max_tokens, 不算截断
+            if output_tokens < 100:
+                return True, "truncated"
         # tool_use 不再当不足(agentic 流正常调工具), 仅作记录
     except Exception:
         pass
@@ -119,10 +123,14 @@ def _check_inadequate(resp_body_bytes, latency_ms):
     return False, ""
 
 
-def _check_inadequate_streaming(stop_reason: str, output_tokens: int, total_ms: float):
+def _check_inadequate_streaming(stop_reason: str, output_tokens: int, total_ms: float,
+                                 requested_max_tokens: int = 0):
     """流式: 用后置抓到的 stop_reason/usage 判定(逻辑与非流式一致)。"""
-    if stop_reason == "max_tokens" and 0 < output_tokens < 100:
-        return True, "truncated"
+    if stop_reason == "max_tokens":
+        if requested_max_tokens > 0 and output_tokens >= requested_max_tokens * 0.5:
+            return False, ""
+        if 0 < output_tokens < 100:
+            return True, "truncated"
     if total_ms > 15000:
         return True, "slow"
     return False, ""
@@ -242,9 +250,26 @@ def _handle_error(rid, candidate_name, status_code, err_display, settings):
 
 # ── 流式安全网: 转发 + 后置抓 stop_reason/usage 喂学习库 ───
 
-async def _stream_with_learning(resp, text: str, settings):
+def _feed_learning(text: str, is_upgrade: bool, reason: str = "") -> None:
+    """清洗文本后喂 upgrade_store。防止系统噪声污染学习数据。"""
+    if not text:
+        return
+    clean, _ = _sanitize(text)
+    if not clean or len(clean) < 3:
+        return
+    if is_upgrade:
+        upgrade_store.record_upgrade(clean, reason)
+    else:
+        upgrade_store.record_success(clean)
+
+async def _stream_with_learning(resp, text: str, settings, requested_max_tokens: int = 0):
     """转发流式响应(零修改), 同时解析 SSE 抓 stop_reason/usage,
-    流结束后判定 flash 是否不足 → 喂 upgrade_store。"""
+    流结束后判定 flash 是否不足 → 喂 upgrade_store。
+
+    v4.4: 捕获上游流式断连(并行 agent + Enter 触发连接复用冲突导致
+    DeepSeek 侧 ReadError/RemoteProtocolError), 不冒泡到 uvicorn。
+    客户端已收到 200 header + 部分内容, 断连后流正常结束。
+    """
     stop_reason = ""
     output_tokens = 0
     buf = b""
@@ -273,6 +298,10 @@ async def _stream_with_learning(resp, text: str, settings):
                     u = evt.get("usage", {}) or {}
                     if u.get("output_tokens"):
                         output_tokens = u["output_tokens"]
+    except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadTimeout) as e:
+        # 上游流式中途断连: 并行 agent 连接复用冲突 / HTTP proxy 抖动
+        # 客户端已收到 200 + 部分内容, 不回退不重试, 静默结束
+        logger.warning(f"[stream] Upstream disconnected mid-stream: {type(e).__name__}")
     finally:
         total_ms = (time.time() - t_start) * 1000
         try:
@@ -280,11 +309,12 @@ async def _stream_with_learning(resp, text: str, settings):
         except Exception:
             pass
         if text:
-            inadequate, reason = _check_inadequate_streaming(stop_reason, output_tokens, total_ms)
+            inadequate, reason = _check_inadequate_streaming(
+                stop_reason, output_tokens, total_ms, requested_max_tokens)
             if inadequate:
-                upgrade_store.record_upgrade(text, reason or stop_reason or "stream_inadequate")
+                _feed_learning(text, True, reason or stop_reason or "stream_inadequate")
             else:
-                upgrade_store.record_success(text)
+                _feed_learning(text, False)
         logger.debug(f"[stream-end] stop={stop_reason} out_tok={output_tokens} "
                      f"total={total_ms:.0f}ms inadequate={inadequate if text else 'n/a'}")
 
@@ -292,7 +322,7 @@ async def _stream_with_learning(resp, text: str, settings):
 async def _upgrade_flash_response(rid, resp_body, resp_ct, text, settings, is_stream,
                                   body, req_headers, client, messages, conf):
     """非流式 flash 被判不足 → 升级到 pro 重发。"""
-    upgrade_store.record_upgrade(text, "nonstream_inadequate")
+    _feed_learning(text, True, "nonstream_inadequate")
     up_dest = _fallback_chain("easy", settings)
     if up_dest:
         up_candidate, up_tier = up_dest[0]
@@ -317,6 +347,7 @@ async def handle_request(body: dict, req_headers: dict, client: httpx.AsyncClien
     rid = request_id_ctx.get()
     messages = body.get("messages", [])
     is_stream = body.get("stream", False)
+    requested_max_tokens = body.get("max_tokens", 0)
 
     score = route(settings, messages)
     text = score.clean_text or _extract_text_from_body(body)
@@ -366,19 +397,19 @@ async def handle_request(body: dict, req_headers: dict, client: httpx.AsyncClien
                     # 流式: 转发 + 后置学习(无法中途升级)
                     latency_tracker.record(candidate, latency_ms, ok=True)
                     _set_sticky(settings, messages, candidate, tier)
-                    return StreamingResponse(_stream_with_learning(resp, text, settings),
+                    return StreamingResponse(_stream_with_learning(resp, text, settings, requested_max_tokens),
                                              media_type="text/event-stream")
                 # 非流式: 读 body 检查
                 resp_body = await resp.aread()
                 resp_ct = resp.headers.get("content-type", "application/json") if hasattr(resp, 'headers') else "application/json"
-                inadequate, reason = _check_inadequate(resp_body, latency_ms)
+                inadequate, reason = _check_inadequate(resp_body, latency_ms, requested_max_tokens)
                 if inadequate:
                     logger.info(f"[{rid}] Flash inadequate ({reason}) → upgrading")
                     similarity_buffer.record_outcome(text, candidate, tier, False, latency_ms, reason)
                     return await _upgrade_flash_response(rid, resp_body, resp_ct, text, settings,
                                                          is_stream, body, req_headers, client, messages, conf)
                 # flash 正常
-                upgrade_store.record_success(text)
+                _feed_learning(text, False)
                 _set_sticky(settings, messages, candidate, tier)
                 if settings.cache.enabled:
                     cache.put(_get_model(conf, "flash"), messages, resp_body, resp_ct)

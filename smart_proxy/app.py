@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response
 import httpx
 from .config import get_settings, Settings
+from . import __version__
 from .server import handler
 from . import state as state_mod
 
@@ -16,7 +17,7 @@ HISTORY_SAVE_INTERVAL = 300  # 每 5 分钟持久化一次历史数据
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    logger.info(f"SmartProxy v4.3 — Starting on {settings.server.host}:{settings.server.port}")
+    logger.info(f"SmartProxy v{__version__} — Starting on {settings.server.host}:{settings.server.port}")
 
     # 注入 YAML 配置到全局 LatencyTracker
     from .metrics import latency_tracker, similarity_buffer, upgrade_store
