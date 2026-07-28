@@ -425,10 +425,11 @@ routing:
 |------|--------|------|
 | `routing.flash_first` | `true` | 是否启用 flash-first |
 | `routing.session_sticky.enabled` | `true` | 同一会话是否复用后端 |
-| `routing.session_sticky.ttl_seconds` | `600` | 会话粘性有效期 |
+| `routing.session_sticky.ttl_seconds` | `600` | Flash 会话粘性有效期 |
+| `routing.session_sticky.pro_ttl_seconds` | `120` | Pro 会话粘性（防 easy 追问绑定贵模型） |
 | `routing.token_length.enabled` | `true` | 是否启用超长上下文检测 |
 | `routing.token_length.threshold_tokens` | `100000` | 超长阈值 |
-| `routing.classifier.enabled` | `true` | LLM 分类器开关（false 可做 A/B） |
+| `routing.classifier.enabled` | `false` | LLM 分类器开关（默认关，仅直连路由用） |
 | `routing.classifier.timeout` | `1.5` | 分类器超时（秒），超时回退 easy |
 | `routing.classifier.cache_size` | `512` | 分类结果 LRU 缓存条目 |
 | `routing.classifier.min_input_tokens` | `200` | 经济闸门：上下文小于此值不调分类器 |
