@@ -131,24 +131,6 @@ class SimilarityBuffer:
                 "flash_samples": len(flash_items),
             }
 
-    def predict_latency(self, text: str, backend_key: str) -> float | None:
-        """基于相似历史请求预测延迟（兼容旧 API）。"""
-        target_tri = self._trigrams(text)
-        with self._lock:
-            scored = []
-            for entry in self._buffer:
-                be_tier = f"{entry['backend']}_{entry['tier']}"
-                if be_tier != backend_key:
-                    continue
-                sim = self._jaccard(target_tri, self._trigrams(entry["text"]))
-                if sim > 0:
-                    scored.append((sim, entry["latency_ms"]))
-            if not scored:
-                return None
-            scored.sort(key=lambda x: -x[0])
-            top = scored[:8]
-            total_weight = sum(s[0] for s in top)
-            return sum(s[0] * s[1] for s in top) / total_weight if total_weight > 0 else None
 
     def stats(self):
         with self._lock:
@@ -190,21 +172,6 @@ class SimilarityBuffer:
         except json.JSONDecodeError as e:
             logger.warning(f"History file corrupt, ignoring: {e}")
             return False
-
-    def _is_good_gram(gram: str) -> bool:
-        """过滤掉无意义的 n-gram：纯标点、纯空格、纯数字。"""
-        if len(gram) < 2:
-            return False
-        # 至少包含一个中文或英文字母
-        has_chinese = any("一" <= c <= "鿿" for c in gram)
-        has_english = any(c.isascii() and c.isalpha() for c in gram)
-        if not has_chinese and not has_english:
-            return False
-        # 排除纯数字
-        digits = sum(1 for c in gram if c.isdigit())
-        if digits == len(gram):
-            return False
-        return True
 
 
 # 全局单例
@@ -314,7 +281,9 @@ class UpgradeStore:
             self._upgraded.append(text[:500])
             if len(self._upgraded) > self._MAX:
                 self._upgraded = self._upgraded[-self._MAX:]
-            self._recompute_locked()
+            # v4.5: 每 10 条升级才重算，跟 record_success 一致，避免每条都跑 jieba POS
+            if len(self._upgraded) % 10 == 0 and len(self._upgraded) >= 3:
+                self._recompute_locked()
             self._dirty = True
         logger.info(f"[UpgradeLearn] upgrade recorded ({reason}) "
                     f"U={len(self._upgraded)} kw={len(self._keywords)}")
@@ -412,6 +381,9 @@ class UpgradeStore:
         with self._lock:
             if not self._dirty:
                 return
+            # v4.5: persist 前强制重算，确保最新 keywords 落盘（即使未达 10 条阈值）
+            if len(self._upgraded) >= 3:
+                self._recompute_locked()
             data = {"upgraded": self._upgraded, "success": self._success, "keywords": self._keywords}
             self._dirty = False
         if filepath is None:

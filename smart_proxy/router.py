@@ -41,7 +41,11 @@ HARD_CORE = [
 
 # ── 动态扩展: UpgradeStore 学到的词(按 medium 计分) ────────
 _extra_keywords: list[str] = []
-_MAX_EXTRA_KW = 200
+_extra_kw_hits: dict[str, int] = {}      # v4.5: 命中计数，用于衰减淘汰
+_EXTRA_KW_MAX = 200
+_EXTRA_KW_DECAY_INTERVAL = 500            # 每 500 次评分触发衰减检查
+_EXTRA_KW_MIN_HITS = 2                    # 低于此命中数 → 移除
+_extra_kw_score_count: int = 0            # 评分调用计数器
 
 
 def extend_keywords(keywords: list[str]) -> list[str]:
@@ -51,20 +55,40 @@ def extend_keywords(keywords: list[str]) -> list[str]:
     added = [kw for kw in keywords if kw and kw.lower() not in existing]
     if added:
         _extra_keywords.extend(added)
-        if len(_extra_keywords) > _MAX_EXTRA_KW:
-            _extra_keywords = _extra_keywords[-_MAX_EXTRA_KW:]
+        if len(_extra_keywords) > _EXTRA_KW_MAX:
+            _extra_keywords = _extra_keywords[-_EXTRA_KW_MAX:]
         logger.info(f"Extended keywords (+{len(added)}, total {len(_extra_keywords)}): {added}")
     return added
+
+
+def _mark_kw_hits(hit_keywords: list[str]) -> None:
+    """v4.5: 记录学到的关键词命中次数，用于衰减淘汰。"""
+    global _extra_kw_hits, _extra_kw_score_count
+    _extra_kw_score_count += 1
+    for kw in hit_keywords:
+        _extra_kw_hits[kw] = _extra_kw_hits.get(kw, 0) + 1
+    # 每 N 次评分衰减一次
+    if _extra_kw_score_count >= _EXTRA_KW_DECAY_INTERVAL:
+        _extra_kw_score_count = 0
+        _decay_unused_keywords()
+
+
+def _decay_unused_keywords() -> None:
+    """v4.5: 移除长期未被命中的学到的关键词。"""
+    global _extra_keywords, _extra_kw_hits
+    before = len(_extra_keywords)
+    _extra_keywords = [kw for kw in _extra_keywords
+                       if _extra_kw_hits.get(kw, 0) >= _EXTRA_KW_MIN_HITS]
+    _extra_kw_hits = {}  # 重置，下一轮重新计数
+    removed = before - len(_extra_keywords)
+    if removed:
+        logger.info(f"[KW-Decay] pruned {removed} unused learned keywords "
+                    f"({before} → {len(_extra_keywords)})")
 
 
 def get_all_indicators() -> dict:
     return {"easy": len(EASY_VERBS), "edit": len(EDIT_VERBS),
             "hard": len(HARD_CORE), "learned": len(_extra_keywords)}
-
-
-def all_keywords() -> list[str]:
-    """返回所有关键词(EASY/EDIT/HARD/learned)的扁平列表, 供学习去重用。"""
-    return list(EASY_VERBS) + list(EDIT_VERBS) + list(HARD_CORE) + list(_extra_keywords)
 
 
 # ── 文本提取 ─────────────────────────────────────────────
@@ -224,8 +248,6 @@ def _sanitize(text: str) -> tuple[str, bool]:
     if has_closed and "<system-reminder" in clean.lower():
         clean = _SYSREM_OPEN_RE.sub("", clean).strip()
 
-    # 仅当剥离后为空才判续传。
-
     # 仅当剥离后为空(纯系统文本/工具结果回传, 无真实指令)才判续传。
     # "ls" / "cd" / "grep" 等短命令不走续传路径, 它们需要启发式评分 + sticky.
     is_continuation = len(clean) == 0
@@ -303,13 +325,28 @@ def _set_sticky(settings, messages, backend, tier):
     key = _session_key(messages)
     if not key:
         return
-    # Pro 粘性更短: 避免 easy 追问被绑定在贵模型上
+    # v4.5: 活跃度续期——如果同一 session 连续命中且间隔 < 30s，
+    # 自动延长 TTL 避免 active 讨论被切成多次分类器调用。
+    now = time.time()
+    ACTIVE_THRESHOLD = 30  # 30 秒内命中视为活跃会话
     if tier == "pro":
-        ttl = sticky.get("pro_ttl_seconds", 120)
+        base_ttl = sticky.get("pro_ttl_seconds", 120)
+        with _sticky_lock:
+            existing = _sticky_store.get(key)
+            if existing and existing[1] == "pro":
+                last_set_time = existing[2] - base_ttl  # 反推上次设置时间
+                if now - last_set_time < ACTIVE_THRESHOLD:
+                    # 活跃会话：TTL 翻倍（最多 300s），避免 medium 任务被频繁重新评估
+                    ttl = min(base_ttl * 2, 300)
+                else:
+                    ttl = base_ttl
+            else:
+                ttl = base_ttl
+            _sticky_store[key] = (backend, tier, now + ttl)
     else:
         ttl = sticky.get("ttl_seconds", 600)
-    with _sticky_lock:
-        _sticky_store[key] = (backend, tier, time.time() + ttl)
+        with _sticky_lock:
+            _sticky_store[key] = (backend, tier, now + ttl)
 
 
 # ── 后端可用性 ───────────────────────────────────────────
@@ -392,9 +429,11 @@ def _heuristic_score(clean: str, settings: Settings) -> tuple[int, str, str]:
         else:
             score += 12
 
-    for kw in _extra_keywords:
-        if kw and kw in lower:
-            score += 12
+    extra_hits = [kw for kw in _extra_keywords if kw and kw in lower]
+    for _ in extra_hits:
+        score += 12
+    if extra_hits:
+        _mark_kw_hits(extra_hits)
 
     # 超长上下文惩罚
     tl = settings.routing.token_length
@@ -412,7 +451,6 @@ def _heuristic_score(clean: str, settings: Settings) -> tuple[int, str, str]:
     # "设计"和"架构"在中文里太泛("设计一个登录页面"≠hard),
     # 现在统一走 score 阈值: single hit=30<40→medium, 2+hits≥60→hard。
     if has_edit and (long_text or score >= THRESHOLD_MEDIUM):
-        return score, "high", ("medium" if score < THRESHOLD_HARD else "hard")
         return score, "high", ("medium" if score < THRESHOLD_HARD else "hard")
     if has_easy and not has_edit and not long_text:
         return score, "high", "easy"

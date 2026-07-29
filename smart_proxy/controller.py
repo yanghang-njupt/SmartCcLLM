@@ -66,26 +66,15 @@ def _backend_ready(name):
 
 
 def _fallback_chain(difficulty: str, settings) -> list[tuple[str, str]]:
+    """返回降级候选链（不含原始尝试），已在函数内去重。"""
     if difficulty == "medium":
-        return [_pick_best(settings), ("deepseek", "flash")]
+        # 原始是 deepseek/pro，降级就是 flash
+        return [("deepseek", "flash")]
     if difficulty == "hard":
+        # 原始可能是 Kimi（可用时），降级先 pro 再 flash
         return [("deepseek", "pro"), ("deepseek", "flash")]
-    # easy / uncertain / continuation → flash → pro → kimi
+    # easy / uncertain / continuation → flash 失败 → 先 pro 再 Kimi
     return [("deepseek", "pro"), _pick_best(settings)]
-
-
-def _token_estimate(messages) -> int:
-    total = 0
-    for msg in (messages if isinstance(messages, list) else []):
-        content = msg.get("content", "") if isinstance(msg, dict) else ""
-        if isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    total += len(b.get("text", ""))
-        elif isinstance(content, str):
-            total += len(content)
-    return total // 4
-
 
 def _extract_text_from_body(body):
     try:
@@ -103,19 +92,27 @@ def _extract_text_from_body(body):
 
 # ── 安全网判定 ───────────────────────────────────────────
 
+def _is_truncated(stop_reason: str, output_tokens: int, requested_max_tokens: int = 0) -> bool:
+    """判断是否因 max_tokens 导致输出被截断。
+    排除短输出误判: 输出 ≥50% 请求上限时不认为截断。
+    """
+    if stop_reason != "max_tokens":
+        return False
+    if output_tokens <= 0:
+        return False
+    if requested_max_tokens > 0 and output_tokens >= requested_max_tokens * 0.5:
+        return False
+    return output_tokens < 100
+
+
 def _check_inadequate(resp_body_bytes, latency_ms, requested_max_tokens: int = 0):
     """非流式: 检查 flash 响应是否不足。"""
     try:
         body = json.loads(resp_body_bytes)
         stop_reason = body.get("stop_reason", "")
         output_tokens = body.get("usage", {}).get("output_tokens", 0)
-        if stop_reason == "max_tokens":
-            # 仅当输出远低于请求上限时才算截断(防短输出误判)
-            if requested_max_tokens > 0 and output_tokens >= requested_max_tokens * 0.5:
-                return False, ""  # 输出了 ≥50% max_tokens, 不算截断
-            if output_tokens < 100:
-                return True, "truncated"
-        # tool_use 不再当不足(agentic 流正常调工具), 仅作记录
+        if _is_truncated(stop_reason, output_tokens, requested_max_tokens):
+            return True, "truncated"
     except Exception:
         pass
     if latency_ms > 15000:
@@ -126,11 +123,8 @@ def _check_inadequate(resp_body_bytes, latency_ms, requested_max_tokens: int = 0
 def _check_inadequate_streaming(stop_reason: str, output_tokens: int, total_ms: float,
                                  requested_max_tokens: int = 0):
     """流式: 用后置抓到的 stop_reason/usage 判定(逻辑与非流式一致)。"""
-    if stop_reason == "max_tokens":
-        if requested_max_tokens > 0 and output_tokens >= requested_max_tokens * 0.5:
-            return False, ""
-        if 0 < output_tokens < 100:
-            return True, "truncated"
+    if _is_truncated(stop_reason, output_tokens, requested_max_tokens):
+        return True, "truncated"
     if total_ms > 15000:
         return True, "slow"
     return False, ""
@@ -154,11 +148,13 @@ async def _resolve_uncertain(score, settings, client, messages, text, rid):
     conf = settings.routing.classifier
     if not conf.get("enabled", True):
         return _apply_difficulty(score, "easy", settings)
-    # 经济闸门: 上下文极小 → 判错也省不回 200 token, 直接 easy
-    input_tokens = _token_estimate(messages)
-    min_tok = conf.get("min_input_tokens", 200)
-    if input_tokens < min_tok:
-        logger.info(f"[{rid}] Uncertain but tiny ctx({input_tokens}tok) → easy, skip classifier")
+    # 经济闸门: 检查 cleaned text 长度而非 messages 总量。
+    # 分类器只看 text[:800]，成本恒定 ~200 token，与会话无关。
+    # 只有用户真没打字（空文本/纯标点）才跳过分分类器。
+    clean = text.strip()
+    min_len = conf.get("min_input_chars", 3)
+    if len(clean) < min_len:
+        logger.info(f"[{rid}] Uncertain but empty text({len(clean)}ch) → easy, skip classifier")
         return _apply_difficulty(score, "easy", settings)
     label = await classifier.classify(client, settings, text)
     if label is None:
@@ -313,6 +309,10 @@ async def _stream_with_learning(resp, text: str, settings, requested_max_tokens:
                 stop_reason, output_tokens, total_ms, requested_max_tokens)
             if inadequate:
                 _feed_learning(text, True, reason or stop_reason or "stream_inadequate")
+                # v4.5: 流式不足也反馈到分类器误判闭环
+                if text:
+                    from . import classifier as classifier_mod
+                    classifier_mod.record_mispredict(text)
             else:
                 _feed_learning(text, False)
         logger.debug(f"[stream-end] stop={stop_reason} out_tok={output_tokens} "
@@ -323,6 +323,10 @@ async def _upgrade_flash_response(rid, resp_body, resp_ct, text, settings, is_st
                                   body, req_headers, client, messages, conf):
     """非流式 flash 被判不足 → 升级到 pro 重发。"""
     _feed_learning(text, True, "nonstream_inadequate")
+    # v4.5: 记录误判反馈——flash 升级说明之前的判定（关键词或分类器）偏轻了
+    if text:
+        from . import classifier as classifier_mod
+        classifier_mod.record_mispredict(text)
     up_dest = _fallback_chain("easy", settings)
     if up_dest:
         up_candidate, up_tier = up_dest[0]
@@ -411,6 +415,7 @@ async def handle_request(body: dict, req_headers: dict, client: httpx.AsyncClien
                 # flash 正常
                 _feed_learning(text, False)
                 _set_sticky(settings, messages, candidate, tier)
+                latency_tracker.record(candidate, latency_ms, ok=True)
                 if settings.cache.enabled:
                     cache.put(_get_model(conf, "flash"), messages, resp_body, resp_ct)
                 return Response(content=resp_body, status_code=200, media_type=resp_ct)

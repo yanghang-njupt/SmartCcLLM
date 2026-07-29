@@ -32,10 +32,10 @@ routing:
     target: { backend: deepseek, tier: pro }
   # LLM 分类器(经济闸门): 仅低置信请求调用, 只看任务描述, 固定 ~200 token
   classifier:
-    enabled: false
-    timeout: 1.5            # 分类器超时(秒), 超时回退启发式
+    enabled: true
+    timeout: 5.0            # 分类器超时(秒), DeepSeek Flash thinking 耗时 ~2-3s
     cache_size: 512         # LRU 缓存条目
-    min_input_tokens: 200   # 上下文小于此值不调(判错也省不回成本)
+    min_input_chars: 3      # 用户文本少于 3 字符(如 "cd")才跳过分类器
 
 circuit:
   block_seconds_quota: 3600

@@ -12,8 +12,23 @@ class ResponseCache:
         self._lock = threading.Lock()
 
     def _key(self, model: str, messages: list) -> str:
-        """基于 model + messages 的 SHA256 摘要。"""
-        raw = json.dumps({"model": model, "messages": messages}, sort_keys=True, ensure_ascii=False)
+        """基于 model + 最后一条 user message 文本的 SHA256 摘要。
+        v4.5: 不再序列化完整 messages 数组（长对话可达数百 KB），
+        只用最后 user text 哈希——同 session 内相同 prompt 重复发送概率极低。
+        """
+        text = ""
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            break
+                elif isinstance(content, str):
+                    text = content
+                break
+        raw = json.dumps({"model": model, "text": text[:200]}, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def get(self, model: str, messages: list) -> tuple[bytes, str] | None:

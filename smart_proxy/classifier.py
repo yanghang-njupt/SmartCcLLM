@@ -14,15 +14,60 @@ logger = logging.getLogger("SmartProxy.Classifier")
 # ── 分类 prompt(中英通用, 极简) ──────────────────────────
 _PROMPT = (
     "判断下面编码任务复杂度, 只回一个词: easy medium hard\n"
-    "easy=读/搜/列/解释/简单问答/单行改/找文件\n"
-    "medium=单文件修复或新功能/小重构\n"
-    "hard=多文件/架构设计/新系统/迁移/安全审计\n"
+    "类别定义:\n"
+    "- easy: 读、搜、列文件、解释代码、简单问答、改一行、找文件\n"
+    "- medium: 修一个函数、写一个新功能、写单元测试、写文档、小重构\n"
+    "- hard: 多文件修改、架构设计、建新系统、跨项目迁移、安全审计\n"
     "任务:"
 )
 
 _VALID = ("easy", "medium", "hard")
 
-# ── LRU + TTL 缓存(进程内, 相同任务文本命中) ───────────────
+# ── v4.5: 分类器误判反馈闭环 ──────────────────────────
+# 当分类器判 easy 但安全网升级到 pro 时，记录文本的 trigram 指纹。
+# 同一 trigram 模式被误判 ≥3 次后，分类器自动将 easy 提升为 medium。
+_mispredict: dict[str, int] = {}    # trigram → 误判次数
+_mispredict_lock = threading.Lock()
+_MISPREDICT_THRESHOLD = 3
+_MISPREDICT_MAX = 500               # 上限防止内存泄漏
+
+
+def _trigrams(text: str) -> set:
+    t = (text or "").lower()
+    if len(t) < 3:
+        return {t} if t else set()
+    return {t[i:i + 3] for i in range(len(t) - 2)}
+
+
+def record_mispredict(text: str) -> None:
+    """安全网从 flash 升级到 pro → 分类器可能判错了 easy。记录 trigram 指纹。"""
+    if not text:
+        return
+    tri = _trigrams(text)
+    with _mispredict_lock:
+        for t in tri:
+            _mispredict[t] = _mispredict.get(t, 0) + 1
+        # 超出上限时清理低频项
+        if len(_mispredict) > _MISPREDICT_MAX:
+            keep = {t: c for t, c in _mispredict.items() if c >= _MISPREDICT_THRESHOLD}
+            if keep:
+                _mispredict.clear()
+                _mispredict.update(keep)
+
+
+def check_easy_override(text: str) -> str | None:
+    """如果文本与已知误判模式高度重叠，返回 'medium' 覆写 easy 判定。"""
+    tri = _trigrams(text)
+    if not tri:
+        return None
+    with _mispredict_lock:
+        if not _mispredict:
+            return None
+        bad_count = sum(1 for t in tri if _mispredict.get(t, 0) >= _MISPREDICT_THRESHOLD)
+        # ≥40% 的 trigrams 来自已知误判模式 → 覆写
+        if bad_count >= len(tri) * 0.4:
+            return "medium"
+    return None
 _cache: dict = {}
 _cache_lock = threading.Lock()
 _cache_ttl = 3600
@@ -44,7 +89,8 @@ def _parse(resp_text: str) -> str | None:
             for w in _VALID:
                 if w in t:
                     return w
-    # 兜底: 直接扫整段文本
+    # DeepSeek Flash 默认启用 thinking，max_tokens 不够时 text 块可能为空，
+    # 但 thinking 块里或 stop_reason 里也可能带答案
     low = resp_text.lower()
     for w in _VALID:
         if w in low:
@@ -96,7 +142,7 @@ async def classify(client: httpx.AsyncClient, settings: Settings, text: str) -> 
             be.url,
             json={
                 "model": model,
-                "max_tokens": 2,
+                "max_tokens": 100,   # DeepSeek Flash 默认 thinking 会吃掉 ~50 token
                 "temperature": 0,
                 "messages": [{"role": "user", "content": _PROMPT + text[:800]}],
             },
@@ -125,6 +171,12 @@ async def classify(client: httpx.AsyncClient, settings: Settings, text: str) -> 
                 pass
 
     if label:
+        # v4.5: 检查是否是已知误判模式——分类器倾向于判 easy 但安全网频繁升级
+        if label == "easy":
+            override = check_easy_override(text)
+            if override:
+                logger.info(f"Classifier easy→{override} (mispredict feedback override)")
+                label = override
         with _cache_lock:
             _cache[k] = (label, now)
             cap = conf.get("cache_size", 512)
