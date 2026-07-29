@@ -2,7 +2,7 @@
 
 > **一句话：自动判断每个请求的难度，简单问题用便宜模型省钱，复杂问题自动升级到强模型保质量。**
 
-版本 4.4 · Python 3.10+ · MIT
+版本 4.5 · Python 3.10+ · MIT
 
 ---
 
@@ -27,8 +27,8 @@
 
 | 难度 | 条件 | 用的模型 | 为什么 |
 |------|------|----------|--------|
-| 🟢 **简单** | 日常对话、小修改 | `deepseek-v4-flash` | 便宜，速度够 |
-| 🟡 **中等** | 设计方案、代码审查 | `deepseek-v4-pro` | 需要更强的理解能力 |
+| 🟢 **简单** | 日常对话、小修改 | `deepseek-v4-flash` (或 claude-haiku-4-5) | 便宜，速度够 |
+| 🟡 **中等** | 设计方案、代码审查、写测试 | `deepseek-v4-pro` | 需要更强的理解能力 |
 | 🔴 **困难** | 重构、安全审计、分布式系统 | `kimi-k2.7`（或降级 pro） | 需要最强的模型 |
 
 **省钱的逻辑**：flash 的价格大约是 pro 的 1/10，大部分日常请求走 flash 就够了。
@@ -80,8 +80,9 @@ SmartProxy 本身是一个 FastAPI 服务，内部有 13 个模块：
            ▼                      │
 ┌──────────────────────────┐     │
 │  classifier.py  LLM 分类器│ ◀───┘  仅低置信请求调用
-│  flash · max_tokens=2     │  只看任务描述(~200 token)
-│  缓存 · 经济闸门          │  → easy/medium/hard
+│  flash · max_tokens=100   │  只看任务描述(~200 token)
+│  thinking 兜底解析 ·       │  → easy/medium/hard
+│  误判反馈闭环 · LRU+TTL   │
 └──────────┬───────────────┘
            ▼
 ┌─────────────────────────────────────────────┐
@@ -111,14 +112,14 @@ SmartProxy 本身是一个 FastAPI 服务，内部有 13 个模块：
 | `__main__.py` | 启动入口，调 uvicorn |
 | `app.py` | FastAPI 装配、生命周期管理、后台探活、学习库持久化 |
 | `server.py` | 接收 HTTP 请求、鉴权、Body 解析 |
-| `router.py` | **请求清洗 + 信号密度评分**（去重、密度、边界），决定走 flash / pro / kimi |
-| `classifier.py` | LLM 分类器（flash 2-token），默认关闭，有需在 YAML 开 |
-| `controller.py` | **执行路由决策**，分类器集成、流式安全网、升级降级重试 |
+| `router.py` | **请求清洗 + 信号密度评分**（去重、密度、边界、关键词衰减），决定走 flash / pro / kimi |
+| `classifier.py` | LLM 分类器（flash 100-token，误判反馈闭环），默认启用，min_input_chars=3 经济闸门 |
+| `controller.py` | **执行路由决策**，分类器集成、流式安全网、升级降级重试、latency 记录 |
 | `config.py` | 读 YAML 配置，支持热加载 |
 | `state.py` | 熔断/过载状态的 JSON 持久化 |
 | `circuit.py` | 熔断冷却时长的指数退避计算 |
-| `metrics.py` | 延迟追踪 + **UpgradeStore (jieba 词性标注+五层过滤)** + 相似度缓冲 |
-| `cache.py` | LRU 响应缓存（仅非流式） |
+| `metrics.py` | 延迟追踪 + **UpgradeStore (jieba 词性标注+五层过滤，每10条重算)** + 相似度缓冲 |
+| `cache.py` | LRU 响应缓存（仅非流式，key 用 text hash 替代全量 messages） |
 | `logging_setup.py` | JSON 结构化日志 |
 
 ---
@@ -155,7 +156,7 @@ v4.4 起改为**分层路由 + 信号密度 + 系统噪声清洗**。每次请�
     │
     ├── 高置信 easy  → flash
     ├── 高置信 hard  → kimi/pro
-    └── 低置信       → uncertain (分类器兜底, 默认关闭)
+    └── 低置信       → uncertain (分类器兜底, 默认启用)
     │
     ▼
 最终难度 → 后端映射
@@ -164,13 +165,13 @@ v4.4 起改为**分层路由 + 信号密度 + 系统噪声清洗**。每次请�
     hard   → kimi-k2.7(不可用则 pro)
 ```
 
-**为什么这样设计**（经济账）：分类器只看任务描述，不看完整上下文，故成本恒定 ~200 token。判错代价（一次完整上下文双读/错档）远大于 200 token，所以对非极小请求稳赚；极小请求由经济闸门直接走 flash。
+**为什么这样设计**（经济账）：分类器只看任务描述，不看完整上下文，故成本恒定 ~100 token。单次分类成本仅 $0.00003，判对一次（避免 easy 误走 pro）即可覆盖 10 天全部分类器开销。极小请求（<3 字符）由经济闸门直接走 flash。
 
 **关键词库**（写在 `router.py`，已大幅精简为高置信核心集）：
 
-- `EASY_VERBS`：ls/grep/cat/find/read/list/show/open/browse/查看/列出/查找…（18 个）
-- `EDIT_VERBS`：fix/implement/refactor/rewrite/debug/编写/修改/重构/修复/重写（10 个）
-- `HARD_CORE`：架构/设计/迁移/migrate/distributed/分布式/审计/oauth/end-to-end/kafka…（12 个）
+- `EASY_VERBS`：ls/grep/cat/find/read/list/show/open/browse/查看/列出/查找…（24 个）
+- `EDIT_VERBS`：fix/implement/refactor/rewrite/debug/编写/修改/重构/修复/重写（11 个）
+- `HARD_CORE`：架构/设计/迁移/migrate/distributed/分布式/审计/oauth/end-to-end/kafka…（14 个）
 - 学到的词（`_extra_keywords`）：由 UpgradeStore 自动注入，无需手改代码
 
 ### 3.2 请求执行与升级链路（controller.py）
@@ -255,14 +256,16 @@ flash 正常返回      ──→ record_success(text) ──→ S 集合(成功
 | v4.3 TF-DF | 同上 | `角度, 问题, 检查, 现在, 单位` |
 | v4.4 jieba POS | 同上 | **`手部, 角度, 弧度, 单位`** |
 
-**持久化**：`logs/upgrade_store.json`，启动加载、每 5 分钟 + 关闭时落盘。`SimilarityBuffer`（相似度延迟预测）保留，但学习主源已切到 UpgradeStore。
+**持久化**：`logs/upgrade_store.json`，启动加载、每 5 分钟 + 关闭时落盘。v4.5：`record_upgrade` 改为每 10 条才触发 jieba 重算（原每次记录都跑），`persist` 前强制兜底确保最新关键词落盘。
+
+**关键词衰减**（v4.5）：学到的关键词带命中计数，每 500 次评分触发衰减检查，命中数 <2 的词自动移除，防止学错的词永存。
 
 ### 3.5 响应缓存
 
 - 仅缓存非流式请求（流式请求无法缓存）
 - LRU 淘汰，最多 128 条
 - TTL 5 分钟
-- Key = SHA256(model + messages)
+- Key = SHA256(model + 最后 user text)[前200字符]（v4.5：不再序列化完整 messages 数组，长对话省性能）
 - 命中时返回 `X-SP-Cache: hit` 响应头
 
 ---
@@ -391,7 +394,7 @@ THRESHOLD_MEDIUM = 12   # 降低 → 更多请求走 pro（保守）
 THRESHOLD_HARD = 40     # 降低 → 更多请求走 kimi（保守）
 ```
 
-### 7.4 分类器开关与调参（A/B 对比）
+### 7.4 分类器调参与 A/B 对比
 
 在 `proxy_config.yaml` 的 `routing.classifier`：
 
@@ -399,12 +402,12 @@ THRESHOLD_HARD = 40     # 降低 → 更多请求走 kimi（保守）
 routing:
   classifier:
     enabled: true            # false → 完全关闭分类器, 回退纯启发式(可做 A/B)
-    timeout: 1.5             # 分类器超时(秒), 超时回退 easy
+    timeout: 5.0             # 分类器超时(秒), 超时回退 easy
     cache_size: 512          # LRU 缓存条目
-    min_input_tokens: 200    # 上下文小于此值不调(经济闸门)
+    min_input_chars: 3       # 用户文本少于 3 字符才跳过分类器
 ```
 
-**如何 A/B**：先记下当前 `analyze_routing.py` 报告的升级率，把 `enabled` 改 `false` 跑一段，再对比。分类器开启应让分流更准（medium 不再误判 easy）。
+**如何 A/B**：先记下当前 `analyze_routing.py` 报告的升级率，把 `enabled` 改 `false` 跑一段，再对比。分类器开启应让分流更准——未开启时关键词拿不准的请求全部走 flash，开启后有分类器兜底。
 
 ### 7.5 扩展后端
 
@@ -426,13 +429,13 @@ routing:
 | `routing.flash_first` | `true` | 是否启用 flash-first |
 | `routing.session_sticky.enabled` | `true` | 同一会话是否复用后端 |
 | `routing.session_sticky.ttl_seconds` | `600` | Flash 会话粘性有效期 |
-| `routing.session_sticky.pro_ttl_seconds` | `120` | Pro 会话粘性（防 easy 追问绑定贵模型） |
+| `routing.session_sticky.pro_ttl_seconds` | `120` | Pro 会话粘性（活跃会话自动续期至 300s） |
 | `routing.token_length.enabled` | `true` | 是否启用超长上下文检测 |
 | `routing.token_length.threshold_tokens` | `100000` | 超长阈值 |
-| `routing.classifier.enabled` | `false` | LLM 分类器开关（默认关，仅直连路由用） |
-| `routing.classifier.timeout` | `1.5` | 分类器超时（秒），超时回退 easy |
+| `routing.classifier.enabled` | `true` | LLM 分类器开关（默认启用，关键词拿不准时调） |
+| `routing.classifier.timeout` | `5.0` | 分类器超时（秒），DeepSeek Flash thinking 耗时 ~2-3s |
 | `routing.classifier.cache_size` | `512` | 分类结果 LRU 缓存条目 |
-| `routing.classifier.min_input_tokens` | `200` | 经济闸门：上下文小于此值不调分类器 |
+| `routing.classifier.min_input_chars` | `3` | 经济闸门：用户文本少于 3 字符（如"cd"）才跳过分类器 |
 
 ### 熔断参数
 | 参数 | 默认值 | 说明 |
@@ -524,16 +527,16 @@ python analyze_routing.py 2026-07-24   # 指定日期
 ```
 .cc-switch/
 ├── smart_proxy/              ★ 核心源码（13 个 .py 文件）
-│   ├── router.py             ★★★ 请求清洗 + 信号密度评分(去重/边界/密度)
-│   ├── classifier.py               LLM 分类器(默认关闭)
-│   ├── controller.py         ★★★ 请求编排 + 流式安全网 + 升级降级
-│   ├── metrics.py            ★★  jieba 词性标注+五层过滤 + 延迟追踪
+│   ├── router.py             ★★★ 请求清洗 + 信号密度评分 + 关键词衰减淘汰
+│   ├── classifier.py               LLM 分类器(默认启用, 误判反馈闭环)
+│   ├── controller.py         ★★★ 请求编排 + 流式安全网 + 升级降级重试
+│   ├── metrics.py            ★★  jieba 词性标注+五层过滤 + 延迟追踪(每10条重算)
 │   ├── app.py                ★    FastAPI 装配 + 探活 + 学习库持久化
 │   ├── server.py                 请求 handler + 鉴权
 │   ├── config.py                 YAML 热加载配置
 │   ├── state.py                  熔断/过载状态管理
 │   ├── circuit.py                指数退避计算
-│   ├── cache.py                  LRU 响应缓存
+│   ├── cache.py                  LRU 响应缓存(text hash key)
 │   ├── logging_setup.py          结构化日志
 │   ├── __main__.py               启动入口
 │   └── __init__.py               版本号
